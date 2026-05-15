@@ -43,7 +43,7 @@ static int require_tlb_flush_capability(const char *op)
     }
 
     if (!kfunc_flush_tlb_page && !kfunc___flush_tlb_range) {
-        pr_info("wxshadow: [%s] using TLBI instruction with ASID (context_id_offset=0x%x)\n",
+        wx_info("wxshadow: [%s] using TLBI instruction with ASID (context_id_offset=0x%x)\n",
                 op, mm_context_id_offset);
     }
 
@@ -250,7 +250,7 @@ static int refresh_dormant_shadow_page(struct wxshadow_page *page_info,
 
     wxshadow_page_pte_unlock(page_info);
 
-    pr_info("wxshadow: [%s] refreshed dormant page %lx to pfn %lx\n",
+    wx_info("wxshadow: [%s] refreshed dormant page %lx to pfn %lx\n",
             op, page_addr, orig_pfn);
     return 0;
 }
@@ -908,7 +908,7 @@ int wxshadow_do_set_bp(void *mm, unsigned long addr)
     int ret;
     int bp_idx;
 
-    pr_info("wxshadow: [set_bp] addr=%lx\n", addr);
+    wx_info("wxshadow: [set_bp] addr=%lx\n", addr);
 
     ret = wxshadow_acquire_write_ctx(mm, addr, "set_bp", &ctx);
     if (ret < 0)
@@ -932,7 +932,7 @@ int wxshadow_do_set_bp(void *mm, unsigned long addr)
         ret = wxshadow_activate_write_ctx(&ctx, false);
         if (ret < 0)
             goto out_abort;
-        pr_info("wxshadow: bp at %lx (existing page)\n", addr);
+        wx_info("wxshadow: bp at %lx (existing page)\n", addr);
         wxshadow_put_write_ctx(&ctx);
         return 0;
     }
@@ -950,7 +950,7 @@ int wxshadow_do_set_bp(void *mm, unsigned long addr)
 
     ret = wxshadow_activate_write_ctx(&ctx, true);
     if (ret == 0) {
-        pr_info("wxshadow: bp at %lx orig_pfn=%lx shadow_pfn=%lx\n",
+        wx_info("wxshadow: bp at %lx orig_pfn=%lx shadow_pfn=%lx\n",
                 addr, ctx.page_info->pfn_original, ctx.page_info->pfn_shadow);
         wxshadow_put_write_ctx(&ctx);
     } else {
@@ -992,7 +992,7 @@ int wxshadow_do_set_reg(void *mm, unsigned long addr,
         if (bp->reg_mods[i].reg_idx == reg_idx) {
             bp->reg_mods[i].value = value;
             bp->reg_mods[i].enabled = true;
-            pr_info("wxshadow: updated reg mod at %lx: x%d=%lx\n",
+            wx_info("wxshadow: updated reg mod at %lx: x%d=%lx\n",
                     addr, reg_idx, value);
             wxshadow_page_put(page_info);
             return 0;
@@ -1009,7 +1009,7 @@ int wxshadow_do_set_reg(void *mm, unsigned long addr,
     bp->reg_mods[i].value = value;
     bp->reg_mods[i].enabled = true;
 
-    pr_info("wxshadow: added reg mod at %lx: x%d=%lx\n", addr, reg_idx, value);
+    wx_info("wxshadow: added reg mod at %lx: x%d=%lx\n", addr, reg_idx, value);
     wxshadow_page_put(page_info);
     return 0;
 }
@@ -1086,7 +1086,7 @@ int wxshadow_do_patch(void *mm, unsigned long addr, void __user *buf, unsigned l
     unsigned long rebuild_len = len;
     int ret;
 
-    pr_info("wxshadow: [patch] addr=%lx len=%lu\n", addr, len);
+    wx_info("wxshadow: [patch] addr=%lx len=%lu\n", addr, len);
 
     if (len == 0 || offset + len > PAGE_SIZE) {
         pr_err("wxshadow: [patch] invalid len=%lu offset=%lu\n", len, offset);
@@ -1127,7 +1127,7 @@ int wxshadow_do_patch(void *mm, unsigned long addr, void __user *buf, unsigned l
             kfunc_kfree(old_patch_data);
             old_patch_data = NULL;
         }
-        pr_info("wxshadow: [patch] existing shadow %lx+%lx (%lu bytes)\n",
+        wx_info("wxshadow: [patch] existing shadow %lx+%lx (%lu bytes)\n",
                 ctx.page_addr, offset, len);
         wxshadow_put_write_ctx(&ctx);
         goto out_free;
@@ -1150,7 +1150,7 @@ int wxshadow_do_patch(void *mm, unsigned long addr, void __user *buf, unsigned l
 
     ret = wxshadow_activate_write_ctx(&ctx, true);
     if (ret == 0) {
-        pr_info("wxshadow: [patch] new shadow %lx+%lx (%lu bytes) pfn %lx->%lx\n",
+        wx_info("wxshadow: [patch] new shadow %lx+%lx (%lu bytes) pfn %lx->%lx\n",
                 ctx.page_addr, offset, len, ctx.page_info->pfn_original,
                 ctx.page_info->pfn_shadow);
     } else {
@@ -1177,7 +1177,7 @@ int wxshadow_do_release(void *mm, unsigned long addr)
     struct wxshadow_page *page_info;
     int ret;
 
-    pr_info("wxshadow: [release] addr=%lx\n", addr);
+    wx_info("wxshadow: [release] addr=%lx\n", addr);
 
     page_info = wxshadow_find_page(mm, addr);
     if (!page_info) {
@@ -1205,7 +1205,7 @@ int wxshadow_do_del_bp(void *mm, unsigned long addr)
     if (!page_info)
         return -2;
 
-    pr_info("wxshadow: del bp at %lx\n", addr);
+    wx_info("wxshadow: del bp at %lx\n", addr);
     ret = wxshadow_release_mod_at_addr(page_info, addr,
                                        WXSHADOW_RELEASE_MATCH_BP,
                                        "last bp removed");
@@ -1248,6 +1248,7 @@ void prctl_before(hook_fargs4_t *args, void *udata)
     void *mm;
     int ret;
     pid_t pid;
+    static int vma_offset_rescan_done;
 
     /* Only track wxshadow prctl calls for in-flight counting */
     if (option < PR_WXSHADOW_SET_BP || option > PR_WXSHADOW_RELEASE)
@@ -1258,6 +1259,16 @@ void prctl_before(hook_fargs4_t *args, void *udata)
     /* Lazy scan mm->context.id offset on first wxshadow prctl call */
     if (mm_context_id_offset < 0)
         try_scan_mm_context_id_offset();
+
+    /*
+     * Module load may run in a kernel-thread context and fail VMA offset
+     * discovery, leaving the fallback offset in place. Retry once from the
+     * caller's user process before any operation that later calls vma_mm(vma).
+     */
+    if (!vma_offset_rescan_done) {
+        scan_vma_struct_offsets();
+        vma_offset_rescan_done = 1;
+    }
 
     switch (option) {
     case PR_WXSHADOW_SET_BP:
@@ -1301,7 +1312,7 @@ void prctl_before(hook_fargs4_t *args, void *udata)
         } else {
             int old_mode = tlb_flush_mode;
             tlb_flush_mode = (int)arg2;
-            pr_info("wxshadow: [prctl] TLB mode changed: %d -> %d\n",
+            wx_info("wxshadow: [prctl] TLB mode changed: %d -> %d\n",
                     old_mode, tlb_flush_mode);
             args->ret = 0;
         }

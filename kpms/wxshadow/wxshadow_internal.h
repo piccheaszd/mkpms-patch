@@ -29,6 +29,17 @@
 #include <predata.h>
 #include "wxshadow.h"
 
+/*
+ * Runtime info logs are noisy because wxshadow can switch mappings and handle
+ * faults frequently.  Keep them compiled out by default; build with
+ * -DWXSHADOW_VERBOSE when diagnosing page-state transitions.
+ */
+#ifdef WXSHADOW_VERBOSE
+#define wx_info(fmt, ...) pr_info(fmt, ##__VA_ARGS__)
+#else
+#define wx_info(fmt, ...) do { } while (0)
+#endif
+
 /* ========== ARM64 CPU helpers ========== */
 
 static inline void cpu_relax(void)

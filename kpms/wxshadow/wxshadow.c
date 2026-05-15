@@ -17,7 +17,7 @@
 #endif
 
 KPM_NAME("wxshadow");
-KPM_VERSION("1.0.0");
+KPM_VERSION("1.1.1");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("wxshadow");
 KPM_DESCRIPTION("W^X Shadow Memory - Hidden Breakpoint Mechanism");
@@ -257,7 +257,7 @@ struct wxshadow_page *wxshadow_create_page(void *mm, unsigned long page_addr)
     list_add(&page->list, &page_list);
     spin_unlock(&global_lock);
 
-    pr_info("wxshadow: created page for mm=%px addr=%lx\n", mm, page_addr);
+    wx_info("wxshadow: created page for mm=%px addr=%lx\n", mm, page_addr);
     return page;
 }
 
@@ -557,7 +557,7 @@ int wxshadow_restore_shadow_ranges(struct wxshadow_page *page)
     if (restored)
         wxshadow_flush_icache_page(page_addr);
 
-    pr_info("wxshadow: [logical_release] restored %lu bytes at addr=%lx\n",
+    wx_info("wxshadow: [logical_release] restored %lu bytes at addr=%lx\n",
             restored, page_addr);
     return 0;
 }
@@ -571,19 +571,19 @@ int wxshadow_validate_page_mapping(void *mm, void *vma,
     unsigned long current_pfn;
 
     if (!vma || vma_start(vma) > page_addr || vma_end(vma) <= page_addr) {
-        pr_info("wxshadow: validate_mapping: VMA invalid for addr %lx\n", page_addr);
+        wx_info("wxshadow: validate_mapping: VMA invalid for addr %lx\n", page_addr);
         return 0;
     }
 
     ptep = get_user_pte(mm, page_addr, NULL);
     if (!ptep) {
-        pr_info("wxshadow: validate_mapping: PTE not found for addr %lx\n", page_addr);
+        wx_info("wxshadow: validate_mapping: PTE not found for addr %lx\n", page_addr);
         return 0;
     }
 
     pte_val = *ptep;
     if (!(pte_val & PTE_VALID)) {
-        pr_info("wxshadow: validate_mapping: PTE invalid for addr %lx\n", page_addr);
+        wx_info("wxshadow: validate_mapping: PTE invalid for addr %lx\n", page_addr);
         return 0;
     }
 
@@ -601,7 +601,7 @@ int wxshadow_validate_page_mapping(void *mm, void *vma,
         }
     }
 
-    pr_info("wxshadow: validate_mapping: PFN mismatch for addr %lx: "
+    wx_info("wxshadow: validate_mapping: PFN mismatch for addr %lx: "
             "current=%lx, orig=%lx, shadow=%lx, state=%d\n",
             page_addr, current_pfn, page_info->pfn_original,
             page_info->pfn_shadow, page_info->state);
@@ -791,7 +791,7 @@ retry:
     spin_unlock(&global_lock);
     wxshadow_page_pte_unlock(page);
 
-    pr_info("wxshadow: [release_clean] %s: addr=%lx mapping retained\n",
+    wx_info("wxshadow: [release_clean] %s: addr=%lx mapping retained\n",
             reason, page->page_addr);
     return 0;
 
@@ -867,7 +867,7 @@ retry:
         if (ret < 0)
             return ret;
 
-        pr_info("wxshadow: [logical_release] %s: addr=%lx state=%d pending until step completes\n",
+        wx_info("wxshadow: [logical_release] %s: addr=%lx state=%d pending until step completes\n",
                 reason, page->page_addr, state);
         return wxshadow_wait_for_logical_release(page, reason);
     }
@@ -905,7 +905,7 @@ retry:
     wxshadow_clear_logical_release_pending_locked(page);
     spin_unlock(&global_lock);
 
-    pr_info("wxshadow: [logical_release] %s: addr=%lx state=%d -> DORMANT\n",
+    wx_info("wxshadow: [logical_release] %s: addr=%lx state=%d -> DORMANT\n",
             reason, page->page_addr, state);
     wxshadow_page_pte_unlock(page);
     return 0;
@@ -1031,7 +1031,7 @@ int wxshadow_teardown_page(struct wxshadow_page *page, const char *reason)
         page->stepping_task && page->stepping_task != current) {
         spin_unlock(&global_lock);
         wxshadow_page_pte_unlock(page);
-        pr_info("wxshadow: [teardown] %s: addr=%lx state=%d pending until step completes\n",
+        wx_info("wxshadow: [teardown] %s: addr=%lx state=%d pending until step completes\n",
                 reason, page->page_addr, state);
         return wxshadow_wait_for_teardown(page, reason);
     }
@@ -1040,7 +1040,7 @@ int wxshadow_teardown_page(struct wxshadow_page *page, const char *reason)
     was_in_list = !list_empty(&page->list);
     spin_unlock(&global_lock);
 
-    pr_info("wxshadow: [teardown] %s: addr=%lx state=%d\n",
+    wx_info("wxshadow: [teardown] %s: addr=%lx state=%d\n",
             reason, page->page_addr, state);
 
     /* --- Step 2: disable single-step with validation --- */
@@ -1183,7 +1183,7 @@ static int wxshadow_teardown_pages_for_mm_impl(void *mm, const char *reason,
     }
 
     if (count > 0)
-        pr_info("wxshadow: [%s] cleaned up %d pages\n", reason, count);
+        wx_info("wxshadow: [%s] cleaned up %d pages\n", reason, count);
     if (first_err < 0)
         pr_warn("wxshadow: [%s] cleanup saw restore failures, first=%d\n",
                 reason, first_err);
@@ -1252,7 +1252,7 @@ int wxshadow_release_pages_for_mm(void *mm, const char *reason)
     } while (!stop && nr == (int)(sizeof(batch) / sizeof(batch[0])));
 
     if (count > 0)
-        pr_info("wxshadow: [%s] logically released %d pages\n",
+        wx_info("wxshadow: [%s] logically released %d pages\n",
                 reason, count);
     if (first_err < 0)
         pr_warn("wxshadow: [%s] logical release saw failures, first=%d\n",
@@ -1275,7 +1275,7 @@ int wxshadow_handle_write_fault(void *mm, unsigned long addr)
         return -1;
     }
 
-    pr_info("wxshadow: write fault at %lx - page content changing\n", addr);
+    wx_info("wxshadow: write fault at %lx - page content changing\n", addr);
 
     ret = wxshadow_release_page_logically(page,
                                           "Write Fault (page modified)");
@@ -1348,7 +1348,7 @@ static long wxshadow_init(const char *args, const char *event, void *__user rese
 {
     int ret;
 
-    pr_info("wxshadow: initializing...\n");
+    wx_info("wxshadow: initializing...\n");
 
     /* Resolve kernel symbols */
     ret = resolve_symbols();
@@ -1380,12 +1380,12 @@ static long wxshadow_init(const char *args, const char *event, void *__user rese
 
     /* Only scan mm->context.id if we need TLBI instruction fallback */
     if (!kfunc_flush_tlb_page && !kfunc___flush_tlb_range) {
-        pr_info("wxshadow: no kernel TLB flush function, need mm->context.id for TLBI\n");
+        wx_info("wxshadow: no kernel TLB flush function, need mm->context.id for TLBI\n");
         ret = try_scan_mm_context_id_offset();
         if (ret < 0) {
             /* Scan may fail if in kernel thread context (ASID=0 in TTBR0).
              * Will retry lazily at first prctl call when in user process context. */
-            pr_info("wxshadow: context.id scan deferred (will retry at first prctl)\n");
+            wx_info("wxshadow: context.id scan deferred (will retry at first prctl)\n");
         }
     }
 
@@ -1395,41 +1395,41 @@ static long wxshadow_init(const char *args, const char *event, void *__user rese
     /* NOTE: Temporarily prefer REGISTER method for testing */
     if (kfunc_register_user_break_hook && kfunc_register_user_step_hook) {
         /* Method 1: register_user_*_hook API (testing priority) */
-        pr_info("wxshadow: using register_user_*_hook API (testing priority)\n");
+        wx_info("wxshadow: using register_user_*_hook API (testing priority)\n");
 
         /* Initialize list_head nodes */
         INIT_LIST_HEAD(&wxshadow_break_hook.node);
         INIT_LIST_HEAD(&wxshadow_step_hook.node);
 
-        pr_info("wxshadow: registering break hook (imm=0x%x)...\n", wxshadow_break_hook.imm);
+        wx_info("wxshadow: registering break hook (imm=0x%x)...\n", wxshadow_break_hook.imm);
         kfunc_register_user_break_hook(&wxshadow_break_hook);
-        pr_info("wxshadow: registered break hook\n");
+        wx_info("wxshadow: registered break hook\n");
 
-        pr_info("wxshadow: registering step hook...\n");
+        wx_info("wxshadow: registering step hook...\n");
         kfunc_register_user_step_hook(&wxshadow_step_hook);
-        pr_info("wxshadow: registered step hook\n");
+        wx_info("wxshadow: registered step hook\n");
 
         hook_method = WX_HOOK_METHOD_REGISTER;
     } else if (kfunc_brk_handler && kfunc_single_step_handler) {
         /* Method 2: Direct hook (fallback) */
-        pr_info("wxshadow: using direct hook method (fallback)\n");
+        wx_info("wxshadow: using direct hook method (fallback)\n");
 
-        pr_info("wxshadow: hooking brk_handler at %px...\n", kfunc_brk_handler);
+        wx_info("wxshadow: hooking brk_handler at %px...\n", kfunc_brk_handler);
         ret = hook_wrap3(kfunc_brk_handler, brk_handler_before, NULL, NULL);
         if (ret != HOOK_NO_ERR) {
             pr_err("wxshadow: failed to hook brk_handler: %d\n", ret);
             return -1;
         }
-        pr_info("wxshadow: hooked brk_handler\n");
+        wx_info("wxshadow: hooked brk_handler\n");
 
-        pr_info("wxshadow: hooking single_step_handler at %px...\n", kfunc_single_step_handler);
+        wx_info("wxshadow: hooking single_step_handler at %px...\n", kfunc_single_step_handler);
         ret = hook_wrap3(kfunc_single_step_handler, single_step_handler_before, NULL, NULL);
         if (ret != HOOK_NO_ERR) {
             pr_err("wxshadow: failed to hook single_step_handler: %d\n", ret);
             hook_unwrap(kfunc_brk_handler, brk_handler_before, NULL);
             return -1;
         }
-        pr_info("wxshadow: hooked single_step_handler\n");
+        wx_info("wxshadow: hooked single_step_handler\n");
 
         hook_method = WX_HOOK_METHOD_DIRECT;
     } else {
@@ -1451,7 +1451,7 @@ static long wxshadow_init(const char *args, const char *event, void *__user rese
         hook_method = WX_HOOK_METHOD_NONE;
         return -1;
     }
-    pr_info("wxshadow: hooked prctl syscall\n");
+    wx_info("wxshadow: hooked prctl syscall\n");
 
     /* Hook do_page_fault for read/exec fault handling */
     if (kfunc_do_page_fault) {
@@ -1461,7 +1461,7 @@ static long wxshadow_init(const char *args, const char *event, void *__user rese
             pr_warn("wxshadow: read hiding will be disabled\n");
             kfunc_do_page_fault = NULL;
         } else {
-            pr_info("wxshadow: hooked do_page_fault for read/exec fault handling\n");
+            wx_info("wxshadow: hooked do_page_fault for read/exec fault handling\n");
         }
     }
 
@@ -1482,7 +1482,7 @@ static long wxshadow_init(const char *args, const char *event, void *__user rese
         hook_method = WX_HOOK_METHOD_NONE;
         return -1;
     } else {
-        pr_info("wxshadow: hooked exit_mmap for proper cleanup\n");
+        wx_info("wxshadow: hooked exit_mmap for proper cleanup\n");
     }
 
     /* Hook follow_page_pte for GUP hiding (/proc/pid/mem, process_vm_readv, ptrace) */
@@ -1493,7 +1493,7 @@ static long wxshadow_init(const char *args, const char *event, void *__user rese
             pr_warn("wxshadow: failed to hook follow_page_pte: %d\n", ret);
             kfunc_follow_page_pte = NULL;
         } else {
-            pr_info("wxshadow: hooked follow_page_pte for GUP hiding\n");
+            wx_info("wxshadow: hooked follow_page_pte for GUP hiding\n");
         }
     }
 
@@ -1506,7 +1506,7 @@ static long wxshadow_init(const char *args, const char *event, void *__user rese
             pr_warn("wxshadow: failed to hook dup_mmap: %d\n", ret);
             kfunc_dup_mmap = NULL;
         } else {
-            pr_info("wxshadow: hooked dup_mmap at %px for fork protection\n",
+            wx_info("wxshadow: hooked dup_mmap at %px for fork protection\n",
                     kfunc_dup_mmap);
         }
     }
@@ -1518,7 +1518,7 @@ static long wxshadow_init(const char *args, const char *event, void *__user rese
             pr_warn("wxshadow: failed to hook uprobe_dup_mmap: %d\n", ret);
             kfunc_uprobe_dup_mmap = NULL;
         } else {
-            pr_info("wxshadow: hooked uprobe_dup_mmap at %px for fork protection\n",
+            wx_info("wxshadow: hooked uprobe_dup_mmap at %px for fork protection\n",
                     kfunc_uprobe_dup_mmap);
         }
     }
@@ -1526,21 +1526,21 @@ static long wxshadow_init(const char *args, const char *event, void *__user rese
         pr_warn("wxshadow: fork protection DISABLED (precise dup_mmap hooks unavailable; copy_process fallback intentionally disabled because it is too broad)\n");
     }
 
-    pr_info("wxshadow: W^X shadow memory module loaded\n");
-    pr_info("wxshadow: use prctl(0x%x, pid, addr) to set breakpoint\n", PR_WXSHADOW_SET_BP);
-    pr_info("wxshadow: use prctl(0x%x, pid, addr, reg, val) to set reg mod\n", PR_WXSHADOW_SET_REG);
-    pr_info("wxshadow: use prctl(0x%x, pid, addr) to delete breakpoint\n", PR_WXSHADOW_DEL_BP);
-    pr_info("wxshadow: use prctl(0x%x, pid, addr, buf, len) to patch shadow\n", PR_WXSHADOW_PATCH);
-    pr_info("wxshadow: use prctl(0x%x, pid, addr) to release shadow\n", PR_WXSHADOW_RELEASE);
+    wx_info("wxshadow: W^X shadow memory module loaded\n");
+    wx_info("wxshadow: use prctl(0x%x, pid, addr) to set breakpoint\n", PR_WXSHADOW_SET_BP);
+    wx_info("wxshadow: use prctl(0x%x, pid, addr, reg, val) to set reg mod\n", PR_WXSHADOW_SET_REG);
+    wx_info("wxshadow: use prctl(0x%x, pid, addr) to delete breakpoint\n", PR_WXSHADOW_DEL_BP);
+    wx_info("wxshadow: use prctl(0x%x, pid, addr, buf, len) to patch shadow\n", PR_WXSHADOW_PATCH);
+    wx_info("wxshadow: use prctl(0x%x, pid, addr) to release shadow\n", PR_WXSHADOW_RELEASE);
     if (kfunc_do_page_fault) {
-        pr_info("wxshadow: read hiding ENABLED (do_page_fault hooked)\n");
+        wx_info("wxshadow: read hiding ENABLED (do_page_fault hooked)\n");
     } else {
-        pr_info("wxshadow: read hiding DISABLED\n");
+        wx_info("wxshadow: read hiding DISABLED\n");
     }
     if (kfunc_follow_page_pte) {
-        pr_info("wxshadow: GUP hiding ENABLED (follow_page_pte hooked)\n");
+        wx_info("wxshadow: GUP hiding ENABLED (follow_page_pte hooked)\n");
     } else {
-        pr_info("wxshadow: GUP hiding DISABLED\n");
+        wx_info("wxshadow: GUP hiding DISABLED\n");
     }
 
     /* Debug: print first 10 processes */
@@ -1586,7 +1586,7 @@ static void wait_for_handlers_drain(const char *phase)
     }
 
     if (iters > 0)
-        pr_info("wxshadow: [%s] drained in-flight handlers (%d iters)\n",
+        wx_info("wxshadow: [%s] drained in-flight handlers (%d iters)\n",
                 phase, iters);
 }
 
@@ -1594,7 +1594,7 @@ static long wxshadow_exit(void *__user reserved)
 {
     int page_count = 0;
 
-    pr_info("wxshadow: unloading...\n");
+    wx_info("wxshadow: unloading...\n");
 
     /*
      * Phase 1: Unhook prctl to block new user operations.
@@ -1602,7 +1602,7 @@ static long wxshadow_exit(void *__user reserved)
      * to handle any in-flight operations while pages are being cleaned.
      */
     unhook_syscalln(__NR_prctl, prctl_before, NULL);
-    pr_info("wxshadow: unhooked prctl (phase 1)\n");
+    wx_info("wxshadow: unhooked prctl (phase 1)\n");
     wait_for_handlers_drain("phase1-prctl");
 
     /*
@@ -1622,14 +1622,14 @@ static long wxshadow_exit(void *__user reserved)
      */
     if (kfunc_dup_mmap) {
         hook_unwrap(kfunc_dup_mmap, before_dup_mmap_wx, after_dup_mmap_wx);
-        pr_info("wxshadow: unhooked dup_mmap (phase 2.5)\n");
+        wx_info("wxshadow: unhooked dup_mmap (phase 2.5)\n");
         wait_for_handlers_drain("phase2.5-dup_mmap");
     }
     if (kfunc_uprobe_dup_mmap) {
         hook_unwrap(kfunc_uprobe_dup_mmap,
                     before_uprobe_dup_mmap_wx,
                     after_uprobe_dup_mmap_wx);
-        pr_info("wxshadow: unhooked uprobe_dup_mmap (phase 2.5)\n");
+        wx_info("wxshadow: unhooked uprobe_dup_mmap (phase 2.5)\n");
         wait_for_handlers_drain("phase2.5-uprobe_dup_mmap");
     }
 
@@ -1644,7 +1644,7 @@ static long wxshadow_exit(void *__user reserved)
     if (hook_method == WX_HOOK_METHOD_DIRECT) {
         hook_unwrap(kfunc_single_step_handler, single_step_handler_before, NULL);
         hook_unwrap(kfunc_brk_handler, brk_handler_before, NULL);
-        pr_info("wxshadow: unhooked brk/step handlers (direct, phase 3)\n");
+        wx_info("wxshadow: unhooked brk/step handlers (direct, phase 3)\n");
 
         /* Wait for any in-flight direct-hook handler to complete */
         wait_for_handlers_drain("phase3-direct");
@@ -1656,10 +1656,10 @@ static long wxshadow_exit(void *__user reserved)
          * rcu_read_lock() while calling our exit, so synchronize_rcu()
          * would deadlock.
          */
-        pr_info("wxshadow: unregistering hooks (manual, phase 3)...\n");
+        wx_info("wxshadow: unregistering hooks (manual, phase 3)...\n");
         wx_unregister_brk_step_hooks();
         wait_for_handlers_drain("phase3-register");
-        pr_info("wxshadow: unregistered break/step hooks (register API, phase 3)\n");
+        wx_info("wxshadow: unregistered break/step hooks (register API, phase 3)\n");
     }
     hook_method = WX_HOOK_METHOD_NONE;
 
@@ -1669,7 +1669,7 @@ static long wxshadow_exit(void *__user reserved)
      */
     if (kfunc_do_page_fault) {
         hook_unwrap(kfunc_do_page_fault, do_page_fault_before, NULL);
-        pr_info("wxshadow: unhooked do_page_fault (phase 4)\n");
+        wx_info("wxshadow: unhooked do_page_fault (phase 4)\n");
         wait_for_handlers_drain("phase4-fault");
     }
 
@@ -1680,7 +1680,7 @@ static long wxshadow_exit(void *__user reserved)
     if (kfunc_follow_page_pte) {
         hook_unwrap(kfunc_follow_page_pte, follow_page_pte_before,
                     follow_page_pte_after);
-        pr_info("wxshadow: unhooked follow_page_pte (phase 4.5)\n");
+        wx_info("wxshadow: unhooked follow_page_pte (phase 4.5)\n");
         wait_for_handlers_drain("phase4.5-follow_page_pte");
     }
 
@@ -1691,17 +1691,17 @@ static long wxshadow_exit(void *__user reserved)
      */
     if (kfunc_exit_mmap) {
         hook_unwrap(kfunc_exit_mmap, exit_mmap_before, NULL);
-        pr_info("wxshadow: unhooked exit_mmap (phase 5)\n");
+        wx_info("wxshadow: unhooked exit_mmap (phase 5)\n");
         wait_for_handlers_drain("phase5-exit_mmap");
     }
 
-    pr_info("wxshadow: module unloaded (cleaned %d pages)\n", page_count);
+    wx_info("wxshadow: module unloaded (cleaned %d pages)\n", page_count);
     return 0;
 }
 
 static long wxshadow_control(const char *args, char *__user out_msg, int outlen)
 {
-    pr_info("wxshadow: control called with args: %s\n", args ? args : "(null)");
+    wx_info("wxshadow: control called with args: %s\n", args ? args : "(null)");
     return 0;
 }
 

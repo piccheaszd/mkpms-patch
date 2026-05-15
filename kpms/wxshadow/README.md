@@ -26,6 +26,23 @@ make wxshadow.kpm       # KPM 模块
 make wxshadow_client    # 用户态客户端
 ```
 
+默认构建为静默版：`wx_info()` 日志不输出到 dmesg，只保留 `pr_warn`/`pr_err`。排查页表切换和 fault 状态机时可加 `-DWXSHADOW_VERBOSE` 重新构建。
+
+## KernelPatch 兼容性
+
+wxshadow 依赖的是 KernelPatch/KPatch-Next 的 KPM ABI：模块元信息段、KPM init/exit、syscall/function hook、kallsyms 和框架扫描到的 task/mm offset。当前修复没有使用 0.13.5 才新增的接口，也不依赖 0.13.1 的私有行为。
+
+本仓库内的 KernelPatch 代码主要提供编译期头文件和 relocation/module ABI。只要运行端的 KPatch-Next 仍兼容这些 KPM 段和 hook API，构建出来的 KPM 就能加载。已在 KernelSU-Next/KPatch-Next 0.13.5、Android 14 / Linux 6.1.75 设备上验证。
+
+## 2026-05 修复说明
+
+这次问题不是 KernelPatch 版本号不匹配导致，而是 wxshadow 自身在特定内核/进程上下文下的页表和 mm 解析假设不成立：
+
+- `get_user_pte()` walk 的是目标进程 `mm->pgd`，也就是用户地址空间 TTBR0；旧逻辑用 TCR_EL1 的 TTBR1 参数计算页表层级，导致用户 text 页地址索引错误，表现为 `get_user_pte failed`。
+- 模块加载时可能处于 kernel-thread 或非目标进程上下文，`vm_area_struct.vm_mm` offset 扫描会失败并落到默认值；后续 PTE 切换再调用 `vma_mm(vma)` 会拿到错误 mm。现在每个 shadow page 持有创建时的 `page->mm`，PTE 切换优先使用它，只把 `vma_mm(vma)` 作为兜底。
+- 首次用户态 `prctl` 时会从真实调用进程上下文再尝试一次 VMA offset 扫描，避免模块加载阶段扫描失败长期污染后续操作。
+- runtime info 日志降噪为 `wx_info()`，默认静默，保留错误和警告便于定位真正失败。
+
 ## 文件结构
 
 | 文件 | 说明 |
@@ -104,6 +121,15 @@ dmesg | grep wxshadow
 kpatch <superkey> kpm unload wxshadow
 ```
 
+KPatch-Next 模块目录持久化示例：
+
+```bash
+backup="wxshadow.kpm.bak.$(date +%Y%m%d-%H%M%S)"
+adb shell "su -c 'cp /data/adb/kp-next/kpm/wxshadow.kpm /data/adb/kp-next/kpm/$backup'"
+adb push build/kpms/wxshadow/wxshadow.kpm /data/local/tmp/wxshadow.kpm
+adb shell "su -c 'cp /data/local/tmp/wxshadow.kpm /data/adb/kp-next/kpm/wxshadow.kpm && chmod 0644 /data/adb/kp-next/kpm/wxshadow.kpm'"
+```
+
 ## 关键限制
 
 - 仅支持 ARM64
@@ -123,4 +149,3 @@ kpatch <superkey> kpm unload wxshadow
 | `follow_page_pte` | hook (可选) | GUP 隐藏 |
 | `copy_process` | hook | fork 保护 |
 | `exit_mmap` | hook | 进程退出清理 |
-

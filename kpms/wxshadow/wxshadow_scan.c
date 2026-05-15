@@ -65,10 +65,10 @@ static unsigned long lookup_name_safe(const char *name)
 
 int resolve_symbols(void)
 {
-    pr_info("wxshadow: resolving symbols...\n");
+    wx_info("wxshadow: resolving symbols...\n");
 
     /* ===== Memory management (all exported) ===== */
-    pr_info("wxshadow: [1/12] mm functions...\n");
+    wx_info("wxshadow: [1/12] mm functions...\n");
     RESOLVE_SYMBOL(find_vma);
     RESOLVE_SYMBOL(get_task_mm);
     RESOLVE_SYMBOL(mmput);
@@ -77,14 +77,14 @@ int resolve_symbols(void)
     /* exit_mmap - required, for proper cleanup on process exit */
     kfunc_exit_mmap = (void *)lookup_name_safe("exit_mmap");
     if (kfunc_exit_mmap) {
-        pr_info("wxshadow: exit_mmap found at %px\n", kfunc_exit_mmap);
+        wx_info("wxshadow: exit_mmap found at %px\n", kfunc_exit_mmap);
     } else {
         pr_err("wxshadow: exit_mmap not found, refusing to load without exit cleanup\n");
         return -ESRCH;
     }
 
     /* ===== Page allocation ===== */
-    pr_info("wxshadow: [2/12] page alloc...\n");
+    wx_info("wxshadow: [2/12] page alloc...\n");
     kfunc___get_free_pages = (typeof(kfunc___get_free_pages))
         lookup_name_safe("__get_free_pages");
     if (!kfunc___get_free_pages) {
@@ -92,7 +92,7 @@ int resolve_symbols(void)
         return -1;
     }
 
-    pr_info("wxshadow: [3/12] page free...\n");
+    wx_info("wxshadow: [3/12] page free...\n");
     kfunc_free_pages = (typeof(kfunc_free_pages))lookup_name_safe("free_pages");
     if (!kfunc_free_pages) {
         pr_err("wxshadow: free_pages not found\n");
@@ -100,21 +100,21 @@ int resolve_symbols(void)
     }
 
     /* ===== Address translation ===== */
-    pr_info("wxshadow: [5/12] address translation...\n");
+    wx_info("wxshadow: [5/12] address translation...\n");
     kvar_memstart_addr = (s64 *)lookup_name_safe("memstart_addr");
     if (!kvar_memstart_addr) {
         pr_err("wxshadow: memstart_addr not found\n");
         return -1;
     }
-    pr_info("wxshadow: memstart_addr=%px, value=0x%llx\n",
+    wx_info("wxshadow: memstart_addr=%px, value=0x%llx\n",
             kvar_memstart_addr, *kvar_memstart_addr);
 
     kvar_physvirt_offset = (s64 *)lookup_name_safe("physvirt_offset");
     if (kvar_physvirt_offset) {
-        pr_info("wxshadow: physvirt_offset=%px, value=0x%llx (KASLR mode)\n",
+        wx_info("wxshadow: physvirt_offset=%px, value=0x%llx (KASLR mode)\n",
                 kvar_physvirt_offset, *kvar_physvirt_offset);
     } else {
-        pr_info("wxshadow: physvirt_offset not found, using traditional memstart_addr mode\n");
+        wx_info("wxshadow: physvirt_offset not found, using traditional memstart_addr mode\n");
     }
 
     /* Determine PAGE_OFFSET based on VA bits from TCR_EL1 */
@@ -138,10 +138,10 @@ int resolve_symbols(void)
                             page_offset_base, kaddr & page_offset_mask);
                     page_offset_base = kaddr & page_offset_mask;
                 }
-                pr_info("wxshadow: PAGE_OFFSET=0x%lx (va_bits=%lld, _stext=0x%lx)\n",
+                wx_info("wxshadow: PAGE_OFFSET=0x%lx (va_bits=%lld, _stext=0x%lx)\n",
                         page_offset_base, va_bits_tmp, kaddr);
             } else {
-                pr_info("wxshadow: PAGE_OFFSET=0x%lx (va_bits=%lld, calculated)\n",
+                wx_info("wxshadow: PAGE_OFFSET=0x%lx (va_bits=%lld, calculated)\n",
                         page_offset_base, va_bits_tmp);
             }
         }
@@ -155,13 +155,13 @@ int resolve_symbols(void)
             if (real_paddr) {
                 detected_physvirt_offset = (s64)test_vaddr - (s64)real_paddr;
                 physvirt_offset_valid = 1;
-                pr_info("wxshadow: AT translation: vaddr=%lx -> paddr=%lx\n",
+                wx_info("wxshadow: AT translation: vaddr=%lx -> paddr=%lx\n",
                         test_vaddr, real_paddr);
-                pr_info("wxshadow: detected physvirt_offset = 0x%llx\n",
+                wx_info("wxshadow: detected physvirt_offset = 0x%llx\n",
                         detected_physvirt_offset);
 
                 unsigned long test_vaddr2 = phys_to_virt_safe(real_paddr);
-                pr_info("wxshadow: round-trip test: paddr=%lx -> vaddr=%lx (match=%d)\n",
+                wx_info("wxshadow: round-trip test: paddr=%lx -> vaddr=%lx (match=%d)\n",
                         real_paddr, test_vaddr2, test_vaddr == test_vaddr2);
             } else {
                 pr_err("wxshadow: AT instruction failed for vaddr=%lx\n", test_vaddr);
@@ -171,27 +171,33 @@ int resolve_symbols(void)
     }
 
     /* ===== Page table operations ===== */
-    pr_info("wxshadow: [6/12] page table ops...\n");
+    wx_info("wxshadow: [6/12] page table ops...\n");
 
     {
         u64 tcr_el1;
-        u64 t1sz, tg1, va_bits;
+        u64 t0sz, tg0, va_bits;
         asm volatile("mrs %0, tcr_el1" : "=r"(tcr_el1));
 
-        t1sz = (tcr_el1 >> 16) & 0x3f;
-        va_bits = 64 - t1sz;
+        /*
+         * get_user_pte() walks a user mm->pgd (TTBR0), so use TCR_EL1.T0*
+         * here. Using T1* describes the kernel half and breaks index
+         * calculation on devices where user VA levels differ from kernel VA
+         * levels, producing get_user_pte failures for every user text page.
+         */
+        t0sz = tcr_el1 & 0x3f;
+        va_bits = 64 - t0sz;
 
-        tg1 = (tcr_el1 >> 30) & 0x3;
+        tg0 = (tcr_el1 >> 14) & 0x3;
         wx_page_shift = 12;
-        if (tg1 == 1) {
-            wx_page_shift = 14;
-        } else if (tg1 == 3) {
+        if (tg0 == 1) {
             wx_page_shift = 16;
+        } else if (tg0 == 2) {
+            wx_page_shift = 14;
         }
 
         wx_page_level = (va_bits - 4) / (wx_page_shift - 3);
 
-        pr_info("wxshadow: TCR_EL1=0x%llx, va_bits=%lld, page_shift=%d, page_level=%d\n",
+        wx_info("wxshadow: TCR_EL1=0x%llx, user_va_bits=%lld, user_page_shift=%d, user_page_level=%d\n",
                 tcr_el1, va_bits, wx_page_shift, wx_page_level);
     }
 
@@ -212,23 +218,23 @@ int resolve_symbols(void)
         pr_err("wxshadow: init_task not found\n");
         return -1;
     }
-    pr_info("wxshadow: wx_init_task at %px\n", wx_init_task);
+    wx_info("wxshadow: wx_init_task at %px\n", wx_init_task);
 
     /* TLB flush - try flush_tlb_page first, fallback to __flush_tlb_range, then TLBI */
     kfunc_flush_tlb_page = (typeof(kfunc_flush_tlb_page))
         lookup_name_safe("flush_tlb_page");
     if (kfunc_flush_tlb_page) {
-        pr_info("wxshadow: flush_tlb_page at %px\n", kfunc_flush_tlb_page);
+        wx_info("wxshadow: flush_tlb_page at %px\n", kfunc_flush_tlb_page);
     } else {
         /* flush_tlb_page is inline on some kernels, try __flush_tlb_range */
         kfunc___flush_tlb_range = (typeof(kfunc___flush_tlb_range))
             lookup_name_safe("__flush_tlb_range");
         if (kfunc___flush_tlb_range) {
-            pr_info("wxshadow: using __flush_tlb_range at %px (fallback)\n", kfunc___flush_tlb_range);
+            wx_info("wxshadow: using __flush_tlb_range at %px (fallback)\n", kfunc___flush_tlb_range);
         } else {
             /* Neither found - will use TLBI instruction fallback */
             pr_warn("wxshadow: neither flush_tlb_page nor __flush_tlb_range found\n");
-            pr_info("wxshadow: will use TLBI instruction fallback (requires mm->context.id detection)\n");
+            wx_info("wxshadow: will use TLBI instruction fallback (requires mm->context.id detection)\n");
         }
     }
 
@@ -236,13 +242,13 @@ int resolve_symbols(void)
     kfunc___split_huge_pmd = (typeof(kfunc___split_huge_pmd))
         lookup_name_safe("__split_huge_pmd");
     if (kfunc___split_huge_pmd) {
-        pr_info("wxshadow: __split_huge_pmd at %px\n", kfunc___split_huge_pmd);
+        wx_info("wxshadow: __split_huge_pmd at %px\n", kfunc___split_huge_pmd);
     } else {
-        pr_info("wxshadow: __split_huge_pmd not found (THP disabled or inlined)\n");
+        wx_info("wxshadow: __split_huge_pmd not found (THP disabled or inlined)\n");
     }
 
     /* ===== Cache operations ===== */
-    pr_info("wxshadow: [7/12] cache ops...\n");
+    wx_info("wxshadow: [7/12] cache ops...\n");
     RESOLVE_SYMBOL(flush_dcache_page);
 
     kfunc___flush_icache_range = (typeof(kfunc___flush_icache_range))
@@ -260,13 +266,13 @@ int resolve_symbols(void)
             lookup_name_safe("invalidate_icache_range");
     }
     if (kfunc___flush_icache_range) {
-        pr_info("wxshadow: using kernel icache flush at %px\n", kfunc___flush_icache_range);
+        wx_info("wxshadow: using kernel icache flush at %px\n", kfunc___flush_icache_range);
     } else {
-        pr_info("wxshadow: using built-in icache flush (dc cvau + ic ialluis)\n");
+        wx_info("wxshadow: using built-in icache flush (dc cvau + ic ialluis)\n");
     }
 
     /* ===== Debug functions ===== */
-    pr_info("wxshadow: [8/12] debug/single-step...\n");
+    wx_info("wxshadow: [8/12] debug/single-step...\n");
     kfunc_user_enable_single_step = (typeof(kfunc_user_enable_single_step))
         lookup_name_safe("user_enable_single_step");
     kfunc_user_disable_single_step = (typeof(kfunc_user_disable_single_step))
@@ -277,14 +283,14 @@ int resolve_symbols(void)
     }
 
     /* ===== BRK/Step hooks ===== */
-    pr_info("wxshadow: [9/12] BRK/step hooks...\n");
+    wx_info("wxshadow: [9/12] BRK/step hooks...\n");
 
     /* Resolve all symbols - let wxshadow_init decide priority */
     /* Direct hook symbols */
     kfunc_brk_handler = (void *)lookup_name_safe("brk_handler");
     kfunc_single_step_handler = (void *)lookup_name_safe("single_step_handler");
-    pr_info("wxshadow: brk_handler = %px\n", kfunc_brk_handler);
-    pr_info("wxshadow: single_step_handler = %px\n", kfunc_single_step_handler);
+    wx_info("wxshadow: brk_handler = %px\n", kfunc_brk_handler);
+    wx_info("wxshadow: single_step_handler = %px\n", kfunc_single_step_handler);
 
     /* Register API symbols */
     kfunc_register_user_break_hook = (typeof(kfunc_register_user_break_hook))
@@ -292,12 +298,12 @@ int resolve_symbols(void)
     kfunc_register_user_step_hook = (typeof(kfunc_register_user_step_hook))
         lookup_name_safe("register_user_step_hook");
 
-    pr_info("wxshadow: register_user_break_hook = %px\n", kfunc_register_user_break_hook);
-    pr_info("wxshadow: register_user_step_hook = %px\n", kfunc_register_user_step_hook);
+    wx_info("wxshadow: register_user_break_hook = %px\n", kfunc_register_user_break_hook);
+    wx_info("wxshadow: register_user_step_hook = %px\n", kfunc_register_user_step_hook);
 
     /* debug_hook_lock for safe manual unregister */
     kptr_debug_hook_lock = (spinlock_t *)lookup_name_safe("debug_hook_lock");
-    pr_info("wxshadow: debug_hook_lock = %px\n", kptr_debug_hook_lock);
+    wx_info("wxshadow: debug_hook_lock = %px\n", kptr_debug_hook_lock);
 
     /* Check if at least one method is available */
     if (!(kfunc_brk_handler && kfunc_single_step_handler) &&
@@ -305,14 +311,14 @@ int resolve_symbols(void)
         pr_err("wxshadow: neither direct hook nor register API available\n");
         return -1;
     }
-    pr_info("wxshadow: [9/12] done\n");
+    wx_info("wxshadow: [9/12] done\n");
 
     /* ===== Locking ===== */
     /* NOTE: mmap_lock and page_table_lock are NOT used - we operate locklessly */
-    pr_info("wxshadow: [10/12] locking... (skipped - lockless operation)\n");
+    wx_info("wxshadow: [10/12] locking... (skipped - lockless operation)\n");
 
     /* ===== RCU ===== */
-    pr_info("wxshadow: [11/12] RCU...\n");
+    wx_info("wxshadow: [11/12] RCU...\n");
     kfunc_rcu_read_lock = (typeof(kfunc_rcu_read_lock))
         lookup_name_safe("__rcu_read_lock");
     kfunc_rcu_read_unlock = (typeof(kfunc_rcu_read_unlock))
@@ -329,11 +335,11 @@ int resolve_symbols(void)
         pr_err("wxshadow: kick_all_cpus_sync not found, refusing to load\n");
         return -ESRCH;
     }
-    pr_info("wxshadow: synchronize_rcu = %px\n", kfunc_synchronize_rcu);
-    pr_info("wxshadow: kick_all_cpus_sync = %px\n", kfunc_kick_all_cpus_sync);
+    wx_info("wxshadow: synchronize_rcu = %px\n", kfunc_synchronize_rcu);
+    wx_info("wxshadow: kick_all_cpus_sync = %px\n", kfunc_kick_all_cpus_sync);
 
     /* ===== Memory allocation ===== */
-    pr_info("wxshadow: [12/12] memory alloc...\n");
+    wx_info("wxshadow: [12/12] memory alloc...\n");
     kfunc_kzalloc = (typeof(kfunc_kzalloc))lookup_name_safe("kzalloc");
     if (!kfunc_kzalloc)
         kfunc_kzalloc = (typeof(kfunc_kzalloc))lookup_name_safe("__kmalloc");
@@ -345,7 +351,7 @@ int resolve_symbols(void)
         pr_err("wxshadow: kzalloc/__kmalloc not found\n");
         return -1;
     }
-    pr_info("wxshadow: kzalloc resolved to %px\n", kfunc_kzalloc);
+    wx_info("wxshadow: kzalloc resolved to %px\n", kfunc_kzalloc);
 
     /* Use lookup_name_safe to avoid module traversal hang */
     kfunc_kcalloc = (typeof(kfunc_kcalloc))lookup_name_safe("kcalloc");
@@ -354,7 +360,7 @@ int resolve_symbols(void)
     if (!kfunc_kcalloc) {
         pr_warn("wxshadow: kcalloc/kmalloc_array not found, will use kzalloc wrapper\n");
     } else {
-        pr_info("wxshadow: kcalloc resolved to %px\n", kfunc_kcalloc);
+        wx_info("wxshadow: kcalloc resolved to %px\n", kfunc_kcalloc);
     }
 
     kfunc_kfree = (typeof(kfunc_kfree))lookup_name_safe("kfree");
@@ -362,7 +368,7 @@ int resolve_symbols(void)
         pr_err("wxshadow: kfree not found\n");
         return -1;
     }
-    pr_info("wxshadow: kfree resolved to %px\n", kfunc_kfree);
+    wx_info("wxshadow: kfree resolved to %px\n", kfunc_kfree);
 
     /* Safe memory access - try copy_from_kernel_nofault first, fallback to probe_kernel_read */
     kfunc_copy_from_kernel_nofault = (typeof(kfunc_copy_from_kernel_nofault))
@@ -372,7 +378,7 @@ int resolve_symbols(void)
             lookup_name_safe("probe_kernel_read");
     }
     if (kfunc_copy_from_kernel_nofault) {
-        pr_info("wxshadow: safe memory access available at %px\n", kfunc_copy_from_kernel_nofault);
+        wx_info("wxshadow: safe memory access available at %px\n", kfunc_copy_from_kernel_nofault);
     } else {
         pr_warn("wxshadow: copy_from_kernel_nofault not found, using direct access (less safe)\n");
     }
@@ -385,7 +391,7 @@ int resolve_symbols(void)
      * kallsyms_lookup_name() calls module_kallsyms_lookup_name() when
      * symbol is not found in vmlinux, which can hang on some kernels.
      */
-    pr_info("wxshadow: [13/14] page fault handler (safe lookup)...\n");
+    wx_info("wxshadow: [13/14] page fault handler (safe lookup)...\n");
     kfunc_do_page_fault = (void *)lookup_name_safe("do_page_fault");
     if (!kfunc_do_page_fault) {
         /* Try alternative names used in different kernel versions */
@@ -397,14 +403,14 @@ int resolve_symbols(void)
     if (!kfunc_do_page_fault) {
         pr_warn("wxshadow: page fault handler not found, read hiding disabled\n");
     } else {
-        pr_info("wxshadow: page fault handler found at %px\n", kfunc_do_page_fault);
+        wx_info("wxshadow: page fault handler found at %px\n", kfunc_do_page_fault);
     }
 
     /* follow_page_pte for GUP hiding (/proc/pid/mem, process_vm_readv, ptrace) */
-    pr_info("wxshadow: [14/14] follow_page_pte (GUP hiding)...\n");
+    wx_info("wxshadow: [14/14] follow_page_pte (GUP hiding)...\n");
     kfunc_follow_page_pte = (void *)lookup_name_safe("follow_page_pte");
     if (kfunc_follow_page_pte) {
-        pr_info("wxshadow: follow_page_pte found at %px\n", kfunc_follow_page_pte);
+        wx_info("wxshadow: follow_page_pte found at %px\n", kfunc_follow_page_pte);
     } else {
         pr_warn("wxshadow: follow_page_pte not found, GUP hiding disabled\n");
     }
@@ -412,21 +418,21 @@ int resolve_symbols(void)
     /* dup_mmap for precise fork protection (real mm duplication only) */
     kfunc_dup_mmap = (void *)lookup_name_safe("dup_mmap");
     if (kfunc_dup_mmap) {
-        pr_info("wxshadow: dup_mmap found at %px\n", kfunc_dup_mmap);
+        wx_info("wxshadow: dup_mmap found at %px\n", kfunc_dup_mmap);
     } else {
         pr_warn("wxshadow: dup_mmap not found, trying uprobe_dup_mmap\n");
     }
 
     kfunc_uprobe_dup_mmap = (void *)lookup_name_safe("uprobe_dup_mmap");
     if (kfunc_uprobe_dup_mmap) {
-        pr_info("wxshadow: uprobe_dup_mmap found at %px\n", kfunc_uprobe_dup_mmap);
+        wx_info("wxshadow: uprobe_dup_mmap found at %px\n", kfunc_uprobe_dup_mmap);
     } else {
         pr_warn("wxshadow: uprobe_dup_mmap not found\n");
     }
 
     /* init_task already resolved above via kallsyms */
 
-    pr_info("wxshadow: all symbols resolved successfully\n");
+    wx_info("wxshadow: all symbols resolved successfully\n");
     return 0;
 }
 
@@ -465,7 +471,7 @@ int scan_mm_struct_offsets(void)
      * Use KP framework's mm_struct_offset.pgd_offset (linux/mm_types.h)
      * Framework detects this in resolve_mm_struct_offset() at boot time.
      */
-    pr_info("wxshadow: using KP framework mm_struct_offset.pgd_offset = 0x%x\n",
+    wx_info("wxshadow: using KP framework mm_struct_offset.pgd_offset = 0x%x\n",
             mm_struct_offset.pgd_offset);
 
     if (mm_struct_offset.pgd_offset < 0) {
@@ -485,7 +491,7 @@ int scan_vma_struct_offsets(void)
     int i;
     int found = 0;
 
-    pr_info("wxshadow: scanning vm_area_struct offsets...\n");
+    wx_info("wxshadow: scanning vm_area_struct offsets...\n");
 
     /*
      * Use current task's mm to find vma offset.
@@ -493,18 +499,18 @@ int scan_vma_struct_offsets(void)
      */
     mm = kfunc_get_task_mm(current);
     if (!mm) {
-        pr_warn("wxshadow: current task has no mm, using default vma offset\n");
+        wx_info("wxshadow: current task has no mm, using default vma offset\n");
         goto use_default;
     }
 
     /* First field of mm_struct is mmap (first VMA) */
     if (!safe_read_ptr((unsigned long)mm, &vma) || !vma) {
-        pr_warn("wxshadow: no VMA in current mm, using default offset\n");
+        wx_info("wxshadow: no VMA in current mm, using default offset\n");
         kfunc_mmput(mm);
         goto use_default;
     }
 
-    pr_info("wxshadow: scanning VMA at %px for mm pointer %px\n", vma, mm);
+    wx_info("wxshadow: scanning VMA at %px for mm pointer %px\n", vma, mm);
 
     /* Search for vm_mm field in vma_struct */
     for (i = 0x10; i < 0x80; i += 8) {
@@ -514,7 +520,7 @@ int scan_vma_struct_offsets(void)
         if (val == (u64)mm) {
             vma_vm_mm_offset = i;
             found = 1;
-            pr_info("wxshadow: vm_area_struct.vm_mm offset: 0x%x\n",
+            wx_info("wxshadow: vm_area_struct.vm_mm offset: 0x%x\n",
                     vma_vm_mm_offset);
             break;
         }
@@ -531,7 +537,7 @@ int scan_vma_struct_offsets(void)
 
 use_default:
     vma_vm_mm_offset = 0x40;
-    pr_info("wxshadow: using default vm_mm offset: 0x%x\n", vma_vm_mm_offset);
+    wx_info("wxshadow: using default vm_mm offset: 0x%x\n", vma_vm_mm_offset);
     return 0;
 }
 
@@ -556,7 +562,7 @@ static int find_comm_offset(void *task)
             buf[3] == 'p' && buf[4] == 'p' && buf[5] == 'e' && buf[6] == 'r') {
             /* Verify it's null-terminated or followed by "/" */
             if (buf[7] == '\0' || (buf[7] == '/' && buf[8] == '0')) {
-                pr_info("wxshadow: found comm at offset 0x%x: \"%.16s\"\n", i, buf);
+                wx_info("wxshadow: found comm at offset 0x%x: \"%.16s\"\n", i, buf);
                 return i;
             }
         }
@@ -572,7 +578,7 @@ int detect_task_struct_offsets(void)
     int16_t comm_offset;
     int16_t active_mm_off;
 
-    pr_info("wxshadow: detecting task_struct offsets...\n");
+    wx_info("wxshadow: detecting task_struct offsets...\n");
 
     if (!wx_init_task) {
         pr_err("wxshadow: wx_init_task is NULL\n");
@@ -585,13 +591,13 @@ int detect_task_struct_offsets(void)
         comm_offset = find_comm_offset(wx_init_task);
         if (comm_offset > 0) {
             task_struct_offset.comm_offset = comm_offset;
-            pr_info("wxshadow: comm_offset = 0x%x (scanned)\n", comm_offset);
+            wx_info("wxshadow: comm_offset = 0x%x (scanned)\n", comm_offset);
         } else {
             pr_err("wxshadow: failed to find comm_offset\n");
             return -1;
         }
     } else {
-        pr_info("wxshadow: comm_offset = 0x%x (from framework)\n", comm_offset);
+        wx_info("wxshadow: comm_offset = 0x%x (from framework)\n", comm_offset);
     }
 
     /* Get active_mm_offset from framework */
@@ -616,13 +622,13 @@ int detect_task_struct_offsets(void)
     if (active_mm_off > 0) {
         search_start = active_mm_off > 0x200 ? active_mm_off - 0x200 : 0x100;
         search_end = active_mm_off;
-        pr_info("wxshadow: scanning tasks_offset based on active_mm_offset=0x%x, range=[0x%x, 0x%x)\n",
+        wx_info("wxshadow: scanning tasks_offset based on active_mm_offset=0x%x, range=[0x%x, 0x%x)\n",
                 active_mm_off, search_start, search_end);
     } else {
         /* Fallback: use comm_offset as upper bound */
         search_start = 0x100;
         search_end = comm_offset < 0x600 ? comm_offset : 0x600;
-        pr_info("wxshadow: active_mm_offset not available, fallback range=[0x%x, 0x%x)\n",
+        wx_info("wxshadow: active_mm_offset not available, fallback range=[0x%x, 0x%x)\n",
                 search_start, search_end);
     }
 
@@ -664,7 +670,7 @@ int detect_task_struct_offsets(void)
                 comm_buf[2] == 'i' && comm_buf[3] == 't') {
                 task_struct_offset.tasks_offset = i;
                 wx_init_process = candidate;
-                pr_info("wxshadow: tasks_offset = 0x%x (based on active_mm_offset=0x%x)\n",
+                wx_info("wxshadow: tasks_offset = 0x%x (based on active_mm_offset=0x%x)\n",
                         i, active_mm_off);
                 break;
             }
@@ -685,7 +691,7 @@ int detect_task_struct_offsets(void)
      */
     if (task_struct_offset.active_mm_offset > 0) {
         task_struct_offset.mm_offset = task_struct_offset.active_mm_offset - 8;
-        pr_info("wxshadow: mm_offset = 0x%x (active_mm_offset - 8)\n",
+        wx_info("wxshadow: mm_offset = 0x%x (active_mm_offset - 8)\n",
                 task_struct_offset.mm_offset);
     } else {
         pr_err("wxshadow: active_mm_offset not available from framework\n");
@@ -694,10 +700,10 @@ int detect_task_struct_offsets(void)
 
     /* pid/tgid: use wxfunc(__task_pid_nr_ns) */
 
-    pr_info("wxshadow: task_struct offsets: tasks=0x%x, mm=0x%x, comm=0x%x\n",
+    wx_info("wxshadow: task_struct offsets: tasks=0x%x, mm=0x%x, comm=0x%x\n",
             task_struct_offset.tasks_offset, task_struct_offset.mm_offset,
             task_struct_offset.comm_offset);
-    pr_info("wxshadow: pid/tgid: using wxfunc(__task_pid_nr_ns)\n");
+    wx_info("wxshadow: pid/tgid: using wxfunc(__task_pid_nr_ns)\n");
 
     return 0;
 }
@@ -809,14 +815,14 @@ static bool check_elf_magic_at_uaddr(void *mm, unsigned long uaddr, int mm_offse
     /* Walk mm's page table to translate user VA to PA */
     pa = walk_pgtable_uaddr(mm, uaddr);
     if (pa == 0) {
-        pr_info("wxshadow:   [0x%x] uaddr=0x%lx -> PA failed\n", mm_offset, uaddr);
+        wx_info("wxshadow:   [0x%x] uaddr=0x%lx -> PA failed\n", mm_offset, uaddr);
         return false;
     }
 
     /* Convert PA to kernel VA */
     kva = phys_to_virt_safe(pa);
     if (!is_kva(kva)) {
-        pr_info("wxshadow:   [0x%x] uaddr=0x%lx -> pa=0x%lx -> kva invalid\n",
+        wx_info("wxshadow:   [0x%x] uaddr=0x%lx -> pa=0x%lx -> kva invalid\n",
                 mm_offset, uaddr, pa);
         return false;
     }
@@ -824,7 +830,7 @@ static bool check_elf_magic_at_uaddr(void *mm, unsigned long uaddr, int mm_offse
     /* Read the first 4 bytes */
     if (kfunc_copy_from_kernel_nofault) {
         if (kfunc_copy_from_kernel_nofault(magic, (const void *)kva, 4) != 0) {
-            pr_info("wxshadow:   [0x%x] uaddr=0x%lx -> kva=0x%lx read failed\n",
+            wx_info("wxshadow:   [0x%x] uaddr=0x%lx -> kva=0x%lx read failed\n",
                     mm_offset, uaddr, kva);
             return false;
         }
@@ -839,7 +845,7 @@ static bool check_elf_magic_at_uaddr(void *mm, unsigned long uaddr, int mm_offse
     found = (magic[0] == ELFMAG0 && magic[1] == ELFMAG1 &&
              magic[2] == ELFMAG2 && magic[3] == ELFMAG3);
 
-    pr_info("wxshadow:   [0x%x] uaddr=0x%lx -> magic=%02x %02x %02x %02x %s\n",
+    wx_info("wxshadow:   [0x%x] uaddr=0x%lx -> magic=%02x %02x %02x %02x %s\n",
             mm_offset, uaddr, magic[0], magic[1], magic[2], magic[3],
             found ? "** ELF FOUND **" : "");
 
@@ -869,9 +875,9 @@ static int scan_by_vdso_elf_magic(struct mm_struct *mm)
         return -1;
     }
 
-    pr_info("wxshadow: scanning for vdso (ELF magic) in mm=%px, pgd_offset=0x%x\n",
+    wx_info("wxshadow: scanning for vdso (ELF magic) in mm=%px, pgd_offset=0x%x\n",
             mm, pgd_off);
-    pr_info("wxshadow: search range: [0x%x, 0x%x)\n",
+    wx_info("wxshadow: search range: [0x%x, 0x%x)\n",
             pgd_off + 0x100, pgd_off + 0x400);
 
     /* Search for vdso pointer after pgd */
@@ -886,7 +892,7 @@ static int scan_by_vdso_elf_magic(struct mm_struct *mm)
         /* Found a user-space pointer, check if it points to ELF magic */
         user_ptr_count++;
         if (check_elf_magic_at_uaddr(mm, val, offset)) {
-            pr_info("wxshadow: === VDSO FOUND at mm+0x%x, vdso_addr=0x%llx ===\n",
+            wx_info("wxshadow: === VDSO FOUND at mm+0x%x, vdso_addr=0x%llx ===\n",
                     offset, val);
 
             /* context.id is right before vdso (8 bytes) */
@@ -913,11 +919,11 @@ static int scan_by_ttbr0_asid(struct mm_struct *mm)
     /* ASID is in bits [63:48] (16-bit ASID) or [55:48] (8-bit ASID) */
     asid = (ttbr0_val >> 48) & 0xFFFF;
 
-    pr_info("wxshadow: TTBR0_EL1=0x%llx, ASID=%llu (0x%llx)\n", ttbr0_val, asid, asid);
+    wx_info("wxshadow: TTBR0_EL1=0x%llx, ASID=%llu (0x%llx)\n", ttbr0_val, asid, asid);
 
     /* ASID=0 is problematic - too many zero fields would match */
     if (asid == 0) {
-        pr_info("wxshadow: ASID=0, cannot use TTBR0 method\n");
+        wx_info("wxshadow: ASID=0, cannot use TTBR0 method\n");
         return -2;
     }
 
@@ -929,7 +935,7 @@ static int scan_by_ttbr0_asid(struct mm_struct *mm)
 
         /* Check if low 16 bits match ASID */
         if ((val & 0xFFFF) == asid) {
-            pr_info("wxshadow: found mm->context.id at offset 0x%x, val=0x%llx (ASID match)\n",
+            wx_info("wxshadow: found mm->context.id at offset 0x%x, val=0x%llx (ASID match)\n",
                     offset, val);
             return offset;
         }
@@ -943,7 +949,7 @@ static int scan_by_ttbr0_asid(struct mm_struct *mm)
 
         if (((val >> 48) & 0xFFFF) == asid ||
             ((val >> 32) & 0xFFFF) == asid) {
-            pr_info("wxshadow: found mm->context.id at offset 0x%x (alt), val=0x%llx\n",
+            wx_info("wxshadow: found mm->context.id at offset 0x%x (alt), val=0x%llx\n",
                     offset, val);
             return offset;
         }
@@ -970,10 +976,10 @@ static int scan_mm_context_id_offset_from_mm(struct mm_struct *mm)
     }
 
     /* Use TTBR0 ASID matching - only reliable method */
-    pr_info("wxshadow: scanning mm->context.id using TTBR0 ASID method...\n");
+    wx_info("wxshadow: scanning mm->context.id using TTBR0 ASID method...\n");
     offset = scan_by_ttbr0_asid(mm);
     if (offset >= 0) {
-        pr_info("wxshadow: mm_context_id_offset = 0x%x\n", offset);
+        wx_info("wxshadow: mm_context_id_offset = 0x%x\n", offset);
         return offset;
     }
 
@@ -1007,7 +1013,7 @@ static struct mm_struct *get_init_process_mm(void)
         return NULL;
     }
 
-    pr_info("wxshadow: init process mm=%px\n", mm);
+    wx_info("wxshadow: init process mm=%px\n", mm);
     return mm;
 }
 
@@ -1027,7 +1033,7 @@ int try_scan_mm_context_id_offset(void)
     if (mm_context_id_offset >= 0)
         return 0;
 
-    pr_info("wxshadow: trying to scan mm->context.id offset...\n");
+    wx_info("wxshadow: trying to scan mm->context.id offset...\n");
 
     /*
      * Method 1: Use init process (pid 1) mm and find vdso by ELF magic.
@@ -1037,7 +1043,7 @@ int try_scan_mm_context_id_offset(void)
     if (mm) {
         offset = scan_by_vdso_elf_magic(mm);
         if (offset >= 0) {
-            pr_info("wxshadow: mm_context_id_offset = 0x%x (vdso method)\n", offset);
+            wx_info("wxshadow: mm_context_id_offset = 0x%x (vdso method)\n", offset);
             mm_context_id_offset = offset;
             return 0;
         }
@@ -1058,7 +1064,7 @@ int try_scan_mm_context_id_offset(void)
     }
 
     if (!mm) {
-        pr_info("wxshadow: current is kernel thread, deferring to prctl\n");
+        wx_info("wxshadow: current is kernel thread, deferring to prctl\n");
         return -1;
     }
 
@@ -1069,7 +1075,7 @@ int try_scan_mm_context_id_offset(void)
     }
 
     /* Will retry at prctl time when in user process context */
-    pr_info("wxshadow: context.id scan deferred to first prctl call\n");
+    wx_info("wxshadow: context.id scan deferred to first prctl call\n");
     return -1;
 }
 
@@ -1080,15 +1086,15 @@ void debug_print_tasks_list(int max_count)
     struct task_struct *p;
     int count = 0;
 
-    pr_info("wxshadow: === DEBUG: tasks list (first %d processes) ===\n", max_count);
-    pr_info("wxshadow: task_struct_offset addr: %px\n", &task_struct_offset);
-    pr_info("wxshadow: task_struct_offset: tasks=0x%x (%d), comm=0x%x (%d), mm=0x%x (%d)\n",
+    wx_info("wxshadow: === DEBUG: tasks list (first %d processes) ===\n", max_count);
+    wx_info("wxshadow: task_struct_offset addr: %px\n", &task_struct_offset);
+    wx_info("wxshadow: task_struct_offset: tasks=0x%x (%d), comm=0x%x (%d), mm=0x%x (%d)\n",
             (unsigned short)task_struct_offset.tasks_offset, task_struct_offset.tasks_offset,
             (unsigned short)task_struct_offset.comm_offset, task_struct_offset.comm_offset,
             (unsigned short)task_struct_offset.mm_offset, task_struct_offset.mm_offset);
-    pr_info("wxshadow: pid/tgid: using wxfunc(__task_pid_nr_ns)\n");
+    wx_info("wxshadow: pid/tgid: using wxfunc(__task_pid_nr_ns)\n");
 
-    pr_info("wxshadow: wx_init_task = %px\n", wx_init_task);
+    wx_info("wxshadow: wx_init_task = %px\n", wx_init_task);
 
     if (task_struct_offset.tasks_offset < 0 ||
         task_struct_offset.comm_offset < 0) {
@@ -1102,7 +1108,7 @@ void debug_print_tasks_list(int max_count)
         return;
     }
 
-    pr_info("wxshadow: wx_init_task (swapper) at %px\n", wx_init_task);
+    wx_info("wxshadow: wx_init_task (swapper) at %px\n", wx_init_task);
 
     /* Iterate using wx_next_task() - fixed implementation in wxshadow_internal.h */
     for (p = wx_init_task; (p = wx_next_task(p)) != wx_init_task && count < max_count; ) {
@@ -1122,11 +1128,11 @@ void debug_print_tasks_list(int max_count)
             safe_read_ptr((unsigned long)p + task_struct_offset.mm_offset, &mm);
         }
 
-        pr_info("wxshadow: [%d] task=%px pid=%d tgid=%d mm=%px comm=\"%.16s\"\n",
+        wx_info("wxshadow: [%d] task=%px pid=%d tgid=%d mm=%px comm=\"%.16s\"\n",
                 count, p, pid, tgid, mm, comm ? comm : "(null)");
 
         count++;
     }
 
-    pr_info("wxshadow: === END tasks list (%d processes printed) ===\n", count);
+    wx_info("wxshadow: === END tasks list (%d processes printed) ===\n", count);
 }

@@ -1,5 +1,17 @@
 # WXSHADOW Changelog
 
+## [1.1.1] - 2026-05-15
+
+### Fixed
+
+- Fixed user page-table walking on Android 14 / Linux 6.1 devices by deriving page-table level information from `TCR_EL1.T0*` for TTBR0/user `mm->pgd` walks. The previous TTBR1-derived calculation could make every executable user mapping fail with `get_user_pte failed`.
+- Avoided relying on `vm_area_struct.vm_mm` offset during PTE transitions. Shadow pages now keep the owning `mm` and PTE switch paths prefer `page->mm`, with `vma_mm(vma)` only as fallback.
+- Retried VMA offset discovery once from the first wxshadow `prctl` caller context, so module-load-time scans from non-user contexts do not permanently poison the fallback offset.
+
+### Changed
+
+- Runtime `pr_info` logs are now routed through `wx_info()` and compiled out by default. Build with `-DWXSHADOW_VERBOSE` to restore detailed state transition logging.
+
 ## [1.1.0] - 2026-01-14
 
 ### Added - 新增自定义 Hook 接口

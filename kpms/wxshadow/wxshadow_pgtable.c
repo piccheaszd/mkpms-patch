@@ -218,7 +218,7 @@ int wxshadow_try_split_pmd(void *mm, void *vma, unsigned long addr)
         unsigned long pmd_shift_val = wx_page_shift + 1 * pxd_bits;
         unsigned long block_mask = ~((1UL << pmd_shift_val) - 1);
 
-        pr_info("wxshadow: splitting PMD block at %lx via __split_huge_pmd\n",
+        wx_info("wxshadow: splitting PMD block at %lx via __split_huge_pmd\n",
                 addr & block_mask);
         kfunc___split_huge_pmd(vma, pmd, addr & block_mask, false, NULL);
     }
@@ -231,7 +231,7 @@ int wxshadow_try_split_pmd(void *mm, void *vma, unsigned long addr)
         return -1;
     }
 
-    pr_info("wxshadow: PMD split succeeded for addr %lx\n", addr);
+    wx_info("wxshadow: PMD split succeeded for addr %lx\n", addr);
     return 0;
 }
 
@@ -528,12 +528,19 @@ static int wxshadow_page_write_pte_locked(struct wxshadow_page *page, void *mm,
     return wxshadow_write_pte_raw(mm, vma, addr, ptep, pte, flush_tlb);
 }
 
+static inline void *wxshadow_page_mm(struct wxshadow_page *page, void *vma)
+{
+    if (page && page->mm)
+        return page->mm;
+    return vma ? vma_mm(vma) : NULL;
+}
+
 static int wxshadow_page_switch_mapping_locked(struct wxshadow_page *page,
                                                void *vma, unsigned long addr,
                                                unsigned long target_pfn,
                                                u64 prot)
 {
-    void *mm = vma_mm(vma);
+    void *mm = wxshadow_page_mm(page, vma);
     u64 *pte;
     u64 entry;
 
@@ -605,6 +612,8 @@ int wxshadow_page_enter_original(struct wxshadow_page *page, void *vma,
                                  unsigned long addr)
 {
     int ret;
+    void *mm;
+    u64 *pte;
     u64 entry;
 
     if (!page)
@@ -629,9 +638,10 @@ int wxshadow_page_enter_original(struct wxshadow_page *page, void *vma,
         return -2;
     }
 
-    ret = wxshadow_page_write_pte_locked(page, vma_mm(vma), vma, addr,
-                                         get_user_pte(vma_mm(vma), addr, NULL),
-                                         entry, true);
+    mm = wxshadow_page_mm(page, vma);
+    pte = get_user_pte(mm, addr, NULL);
+    ret = wxshadow_page_write_pte_locked(page, mm, vma, addr, pte, entry,
+                                         true);
     if (ret == 0) {
         spin_lock(&global_lock);
         if (!page->dead)
@@ -683,6 +693,8 @@ int wxshadow_page_begin_stepping(struct wxshadow_page *page, void *vma,
                                  unsigned long addr, void *task)
 {
     int ret;
+    void *mm;
+    u64 *pte;
     u64 entry;
 
     if (!page || !task)
@@ -717,9 +729,10 @@ int wxshadow_page_begin_stepping(struct wxshadow_page *page, void *vma,
         return -2;
     }
 
-    ret = wxshadow_page_write_pte_locked(page, vma_mm(vma), vma, addr,
-                                         get_user_pte(vma_mm(vma), addr, NULL),
-                                         entry, true);
+    mm = wxshadow_page_mm(page, vma);
+    pte = get_user_pte(mm, addr, NULL);
+    ret = wxshadow_page_write_pte_locked(page, mm, vma, addr, pte, entry,
+                                         true);
     if (ret == 0) {
         wxshadow_flush_icache_page(addr);
     } else {
@@ -740,6 +753,8 @@ int wxshadow_page_finish_stepping(struct wxshadow_page *page, void *vma,
                                   unsigned long addr, void *task)
 {
     int ret;
+    void *mm;
+    u64 *pte;
     unsigned long shadow_pfn;
     bool release_pending;
     bool logical_release_pending;
@@ -775,9 +790,9 @@ int wxshadow_page_finish_stepping(struct wxshadow_page *page, void *vma,
             return -2;
         }
 
-        ret = wxshadow_page_write_pte_locked(page, vma_mm(vma), vma, addr,
-                                             get_user_pte(vma_mm(vma), addr,
-                                                          NULL),
+        mm = wxshadow_page_mm(page, vma);
+        pte = get_user_pte(mm, addr, NULL);
+        ret = wxshadow_page_write_pte_locked(page, mm, vma, addr, pte,
                                              original_entry, true);
         if (ret == 0)
             wxshadow_flush_icache_page(addr);
@@ -815,9 +830,9 @@ int wxshadow_page_finish_stepping(struct wxshadow_page *page, void *vma,
             return -2;
         }
 
-        ret = wxshadow_page_write_pte_locked(page, vma_mm(vma), vma, addr,
-                                             get_user_pte(vma_mm(vma), addr,
-                                                          NULL),
+        mm = wxshadow_page_mm(page, vma);
+        pte = get_user_pte(mm, addr, NULL);
+        ret = wxshadow_page_write_pte_locked(page, mm, vma, addr, pte,
                                              original_entry, true);
         if (ret == 0)
             wxshadow_flush_icache_page(addr);
@@ -863,6 +878,8 @@ int wxshadow_page_enter_dormant_locked(struct wxshadow_page *page, void *vma,
                                        unsigned long addr)
 {
     int ret;
+    void *mm;
+    u64 *pte;
     u64 entry;
 
     if (!page || !vma || !page->pfn_original)
@@ -872,9 +889,10 @@ int wxshadow_page_enter_dormant_locked(struct wxshadow_page *page, void *vma,
     if (!entry)
         return -1;
 
-    ret = wxshadow_page_write_pte_locked(page, vma_mm(vma), vma, addr,
-                                         get_user_pte(vma_mm(vma), addr, NULL),
-                                         entry, true);
+    mm = wxshadow_page_mm(page, vma);
+    pte = get_user_pte(mm, addr, NULL);
+    ret = wxshadow_page_write_pte_locked(page, mm, vma, addr, pte, entry,
+                                         true);
     if (ret == 0) {
         wxshadow_flush_icache_page(addr);
         spin_lock(&global_lock);
@@ -892,6 +910,8 @@ int wxshadow_page_restore_original_for_teardown_locked(
     struct wxshadow_page *page, void *vma, unsigned long addr)
 {
     int ret;
+    void *mm;
+    u64 *pte;
     u64 entry;
 
     if (!page || !vma || !page->pfn_original)
@@ -901,9 +921,10 @@ int wxshadow_page_restore_original_for_teardown_locked(
     if (!entry)
         return -1;
 
-    ret = wxshadow_page_write_pte_locked(page, vma_mm(vma), vma, addr,
-                                         get_user_pte(vma_mm(vma), addr, NULL),
-                                         entry, true);
+    mm = wxshadow_page_mm(page, vma);
+    pte = get_user_pte(mm, addr, NULL);
+    ret = wxshadow_page_write_pte_locked(page, mm, vma, addr, pte, entry,
+                                         true);
     if (ret == 0)
         wxshadow_flush_icache_page(addr);
 
@@ -974,6 +995,7 @@ int wxshadow_page_finish_gup_hide(struct wxshadow_page *page, void *vma,
                                   unsigned long addr, u64 *ptep, u64 orig_pte)
 {
     int ret = 0;
+    void *mm;
 
     if (!page)
         return -1;
@@ -990,8 +1012,9 @@ int wxshadow_page_finish_gup_hide(struct wxshadow_page *page, void *vma,
         goto out_unlock;
     }
 
-    ret = wxshadow_page_write_pte_locked(page, vma_mm(vma), vma, addr, ptep,
-                                         orig_pte, true);
+    mm = wxshadow_page_mm(page, vma);
+    ret = wxshadow_page_write_pte_locked(page, mm, vma, addr, ptep, orig_pte,
+                                         true);
 
 out_unlock:
     wxshadow_page_pte_unlock(page);

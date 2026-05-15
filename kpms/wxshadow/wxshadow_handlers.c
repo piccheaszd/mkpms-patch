@@ -58,7 +58,7 @@ int wxshadow_handle_read_fault(void *mm, unsigned long addr)
 
     ret = wxshadow_page_enter_original(page_info, vma, page_addr);
     if (ret == 0)
-        pr_info("wxshadow: read fault at %lx, switched to live original (r--)\n", addr);
+        wx_info("wxshadow: read fault at %lx, switched to live original (r--)\n", addr);
 
     wxshadow_page_put(page_info);  /* release caller ref */
     return ret == 0 ? 0 : -1;
@@ -113,7 +113,7 @@ int wxshadow_handle_exec_fault(void *mm, unsigned long addr)
 
     ret = wxshadow_page_resume_shadow(page_info, vma, page_addr);
     if (ret == 0)
-        pr_info("wxshadow: exec fault at %lx, switched to shadow (--x)\n", addr);
+        wx_info("wxshadow: exec fault at %lx, switched to shadow (--x)\n", addr);
 
     wxshadow_page_put(page_info);  /* release caller ref */
     return ret == 0 ? 0 : -1;
@@ -314,7 +314,7 @@ static void exit_mmap_before_impl(hook_fargs1_t *args, void *udata)
 
     nr = wxshadow_teardown_pages_for_mm(mm, "exit_mmap");
     if (nr > 0)
-        pr_info("wxshadow: [exit_mmap] cleaned %d pages for mm=%px\n",
+        wx_info("wxshadow: [exit_mmap] cleaned %d pages for mm=%px\n",
                 nr, mm);
 }
 
@@ -458,7 +458,7 @@ static void wxshadow_pause_parent_shadow_pages(void *parent_mm)
     } while (nr == FORK_FIX_BATCH);
 
     if (total_progress > 0) {
-        pr_info("wxshadow: [fork] paused %d parent shadow PTEs (mm=%px)\n",
+        wx_info("wxshadow: [fork] paused %d parent shadow PTEs (mm=%px)\n",
                 total_progress, parent_mm);
     }
 }
@@ -544,7 +544,7 @@ static void wxshadow_resume_parent_shadow_pages(void *parent_mm)
     } while (nr == FORK_FIX_BATCH);
 
     if (total_progress > 0) {
-        pr_info("wxshadow: [fork] resumed %d parent shadow PTEs (mm=%px)\n",
+        wx_info("wxshadow: [fork] resumed %d parent shadow PTEs (mm=%px)\n",
                 total_progress, parent_mm);
     }
 }
@@ -665,17 +665,17 @@ void after_copy_process_wx(hook_fargs8_t *args, void *udata)
 /* Print register info */
 static void wxshadow_print_regs(struct pt_regs *regs, unsigned long pc)
 {
-    pr_info("wxshadow: ======== Breakpoint Hit ========\n");
-    pr_info("wxshadow: PC=%lx\n", pc);
-    pr_info("wxshadow: x0=%016llx x1=%016llx x2=%016llx x3=%016llx\n",
+    wx_info("wxshadow: ======== Breakpoint Hit ========\n");
+    wx_info("wxshadow: PC=%lx\n", pc);
+    wx_info("wxshadow: x0=%016llx x1=%016llx x2=%016llx x3=%016llx\n",
             regs->regs[0], regs->regs[1], regs->regs[2], regs->regs[3]);
-    pr_info("wxshadow: x4=%016llx x5=%016llx x6=%016llx x7=%016llx\n",
+    wx_info("wxshadow: x4=%016llx x5=%016llx x6=%016llx x7=%016llx\n",
             regs->regs[4], regs->regs[5], regs->regs[6], regs->regs[7]);
-    pr_info("wxshadow: x29(fp)=%016llx x30(lr)=%016llx\n",
+    wx_info("wxshadow: x29(fp)=%016llx x30(lr)=%016llx\n",
             regs->regs[29], regs->regs[30]);
-    pr_info("wxshadow: sp=%016llx pstate=%016llx\n",
+    wx_info("wxshadow: sp=%016llx pstate=%016llx\n",
             regs->sp, regs->pstate);
-    pr_info("wxshadow: ================================\n");
+    wx_info("wxshadow: ================================\n");
 }
 
 /* Apply register modifications */
@@ -688,11 +688,11 @@ static void wxshadow_apply_reg_mods(struct pt_regs *regs, struct wxshadow_bp *bp
             continue;
 
         if (mod->reg_idx <= 30) {
-            pr_info("wxshadow: modifying x%d: %016llx -> %016llx\n",
+            wx_info("wxshadow: modifying x%d: %016llx -> %016llx\n",
                     mod->reg_idx, regs->regs[mod->reg_idx], mod->value);
             regs->regs[mod->reg_idx] = mod->value;
         } else if (mod->reg_idx == 31) {
-            pr_info("wxshadow: modifying sp: %016llx -> %016llx\n",
+            wx_info("wxshadow: modifying sp: %016llx -> %016llx\n",
                     regs->sp, mod->value);
             regs->sp = mod->value;
         }
@@ -749,18 +749,18 @@ static struct wxshadow_page *wxshadow_find_by_addr(void *mm, unsigned long addr)
             }
 
             if (page_info->state == WX_STATE_SHADOW_X) {
-                pr_info("wxshadow: find_by_addr: waited %d iterations for STEPPING->SHADOW_X\n", retry);
+                wx_info("wxshadow: find_by_addr: waited %d iterations for STEPPING->SHADOW_X\n", retry);
                 page_info->refcount++;  /* caller's reference */
                 spin_unlock(&global_lock);
                 return page_info;
             }
 
-            pr_info("wxshadow: find_by_addr: timeout waiting for STEPPING, state=%d\n",
+            wx_info("wxshadow: find_by_addr: timeout waiting for STEPPING, state=%d\n",
                     page_info->state);
             goto not_found;
         }
 
-        pr_info("wxshadow: find_by_addr: found page but state=%d (need SHADOW_X=%d)\n",
+        wx_info("wxshadow: find_by_addr: found page but state=%d (need SHADOW_X=%d)\n",
                 page_info->state, WX_STATE_SHADOW_X);
     }
 not_found:
@@ -812,7 +812,7 @@ static int wxshadow_brk_handler_impl(struct pt_regs *regs, unsigned int esr)
     struct wxshadow_bp *bp;
     int ret;
 
-    pr_info("wxshadow: BRK handler ENTER pc=%lx esr=%x mm=%px\n", pc, esr, mm);
+    wx_info("wxshadow: BRK handler ENTER pc=%lx esr=%x mm=%px\n", pc, esr, mm);
 
     if (!mm)
         return DBG_HOOK_ERROR;
@@ -820,12 +820,12 @@ static int wxshadow_brk_handler_impl(struct pt_regs *regs, unsigned int esr)
     page_info = wxshadow_find_by_addr(mm, pc);  /* caller ref */
     if (!page_info) {
         if (wxshadow_can_resume_stale_brk(mm, pc)) {
-            pr_info("wxshadow: BRK: stale trap at pc=%lx after release, resume current mapping\n",
+            wx_info("wxshadow: BRK: stale trap at pc=%lx after release, resume current mapping\n",
                     pc);
             kfunc_mmput(mm);
             return DBG_HOOK_HANDLED;
         }
-        pr_info("wxshadow: BRK: not our breakpoint at pc=%lx\n", pc);
+        wx_info("wxshadow: BRK: not our breakpoint at pc=%lx\n", pc);
         kfunc_mmput(mm);
         return DBG_HOOK_ERROR;
     }
@@ -870,7 +870,7 @@ static int wxshadow_brk_handler_impl(struct pt_regs *regs, unsigned int esr)
         wxshadow_page_put(page_info);
         kfunc_mmput(mm);
         if (ret == -16) {
-            pr_info("wxshadow: BRK: page released while entering step at pc=%lx, resume on original mapping\n",
+            wx_info("wxshadow: BRK: page released while entering step at pc=%lx, resume on original mapping\n",
                     pc);
             return DBG_HOOK_HANDLED;
         }
@@ -889,7 +889,7 @@ static int wxshadow_brk_handler_impl(struct pt_regs *regs, unsigned int esr)
 
     kfunc_user_enable_single_step(current);
 
-    pr_info("wxshadow: BRK handler EXIT success, single-step enabled\n");
+    wx_info("wxshadow: BRK handler EXIT success, single-step enabled\n");
     return DBG_HOOK_HANDLED;
 }
 
@@ -945,12 +945,12 @@ static int wxshadow_step_handler_impl(struct pt_regs *regs, unsigned int esr)
     spin_unlock(&global_lock);
 
     if (!found) {
-        pr_info("wxshadow: step handler: NOT FOUND! pc=%llx mm=%px current=%px\n",
+        wx_info("wxshadow: step handler: NOT FOUND! pc=%llx mm=%px current=%px\n",
                 regs->pc, mm, current);
         spin_lock(&global_lock);
         list_for_each(pos, &page_list) {
             page_info = container_of(pos, struct wxshadow_page, list);
-            pr_info("wxshadow:   page mm=%px addr=%lx: state=%d stepping_task=%px\n",
+            wx_info("wxshadow:   page mm=%px addr=%lx: state=%d stepping_task=%px\n",
                     page_info->mm, page_info->page_addr, page_info->state, page_info->stepping_task);
         }
         spin_unlock(&global_lock);
@@ -989,12 +989,12 @@ static int wxshadow_step_handler_impl(struct pt_regs *regs, unsigned int esr)
     }
 
     if (ret > 0) {
-        pr_info("wxshadow: step done at pc=%llx, finalized pending release\n",
+        wx_info("wxshadow: step done at pc=%llx, finalized pending release\n",
                 regs->pc);
     } else {
-        pr_info("wxshadow: step done at pc=%llx, switched back to shadow\n",
+        wx_info("wxshadow: step done at pc=%llx, switched back to shadow\n",
                 regs->pc);
-        pr_info("wxshadow: step: state updated to SHADOW_X\n");
+        wx_info("wxshadow: step: state updated to SHADOW_X\n");
     }
     wxshadow_page_put(page_info);  /* release caller ref */
     kfunc_mmput(mm);
