@@ -130,7 +130,7 @@ int16_t vma_vm_mm_offset = -1;
 int16_t mm_context_id_offset = -1;
 
 /* TLB flush mode (default: auto) */
-int tlb_flush_mode = WX_TLB_MODE_PRECISE;
+int tlb_flush_mode = WX_TLB_MODE_AUTO;
 
 /* ========== Global state ========== */
 
@@ -182,6 +182,9 @@ void wxshadow_page_put(struct wxshadow_page *page)
     int nr_patch_data = 0;
     int i;
 
+    if (!page)
+        return;
+
     spin_lock(&global_lock);
     should_free = (--page->refcount == 0);
     if (should_free) {
@@ -223,7 +226,7 @@ struct wxshadow_page *wxshadow_find_page(void *mm, unsigned long addr)
     spin_lock(&global_lock);
     list_for_each(pos, &page_list) {
         page = container_of(pos, struct wxshadow_page, list);
-        if (page->mm == mm && page->page_addr == target_addr) {
+        if (!page->dead && page->mm == mm && page->page_addr == target_addr) {
             page->refcount++;          /* caller's reference */
             spin_unlock(&global_lock);
             return page;
@@ -238,6 +241,8 @@ struct wxshadow_page *wxshadow_find_page(void *mm, unsigned long addr)
  */
 struct wxshadow_page *wxshadow_create_page(void *mm, unsigned long page_addr)
 {
+    struct list_head *pos;
+    struct wxshadow_page *existing;
     struct wxshadow_page *page;
 
     /* Allocate new page structure */
@@ -254,6 +259,16 @@ struct wxshadow_page *wxshadow_create_page(void *mm, unsigned long page_addr)
     INIT_LIST_HEAD(&page->list);
 
     spin_lock(&global_lock);
+    list_for_each(pos, &page_list) {
+        existing = container_of(pos, struct wxshadow_page, list);
+        if (!existing->dead && existing->mm == mm &&
+            existing->page_addr == page_addr) {
+            existing->refcount++;      /* caller's reference */
+            spin_unlock(&global_lock);
+            kfunc_kfree(page);
+            return existing;
+        }
+    }
     list_add(&page->list, &page_list);
     spin_unlock(&global_lock);
 
@@ -269,17 +284,23 @@ struct wxshadow_page *wxshadow_create_page(void *mm, unsigned long page_addr)
  */
 void wxshadow_free_page(struct wxshadow_page *page)
 {
+    bool was_listed = false;
+
     if (!page)
         return;
 
     spin_lock(&global_lock);
     page->dead = true;
-    list_del_init(&page->list);
+    if (!list_empty(&page->list)) {
+        list_del_init(&page->list);
+        was_listed = true;
+    }
     spin_unlock(&global_lock);
 
     /* Release the list's ref.  When refcount reaches 0, page_put
      * frees shadow_page and the struct itself. */
-    wxshadow_page_put(page);
+    if (was_listed)
+        wxshadow_page_put(page);
 }
 
 struct wxshadow_bp *wxshadow_find_bp(struct wxshadow_page *page_info, unsigned long pc)
@@ -346,7 +367,7 @@ static void wxshadow_bitmap_set_range(unsigned long *bitmap,
     if (!bitmap || offset >= PAGE_SIZE || len == 0)
         return;
 
-    if (offset + len > PAGE_SIZE)
+    if (len > PAGE_SIZE - offset)
         len = PAGE_SIZE - offset;
 
     for (i = offset; i < offset + len; i++) {
@@ -365,7 +386,7 @@ static void wxshadow_bitmap_clear_range(unsigned long *bitmap,
     if (!bitmap || offset >= PAGE_SIZE || len == 0)
         return;
 
-    if (offset + len > PAGE_SIZE)
+    if (len > PAGE_SIZE - offset)
         len = PAGE_SIZE - offset;
 
     for (i = offset; i < offset + len; i++) {

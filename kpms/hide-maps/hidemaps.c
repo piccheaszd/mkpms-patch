@@ -13,7 +13,7 @@
 #include "../common/kpm_demo_helpers.h"
 
 ///< The name of the module, each KPM must has a unique name.
-KPM_MODULE_INFO("kpm-hide-maps", "1.0.0", "GPL v2", "wwb", "KernelPatch Module Example");
+KPM_MODULE_INFO("kpm-hide-maps", "1.0.1", "GPL v2", "wwb", "Hide wxshadow/rustfrida helper VMAs from /proc/<pid>/maps");
 
 
 typedef struct seq_file {
@@ -23,36 +23,41 @@ typedef struct seq_file {
     size_t count;
 } seq_file;
 
-void *(*vmalloc)(unsigned long size);
-void (*vfree)(void * ponit);
-void *show_map_vma;
-int flag = false;
+static void *(*vmalloc)(unsigned long size);
+static void (*vfree)(void *point);
+static void *show_map_vma;
 
 void show_map_vma_before(hook_fargs2_t* args, void * udata){
     seq_file* m = (seq_file*) args->arg0;
-    args->local.data0 = m->count;
+    args->local.data0 = m ? m->count : 0;
 }
 
 void show_map_vma_after(hook_fargs2_t* args, void * udata){
-    // pr_info("KP: enter vma after \n");
-
-    int start = args->local.data0;
     seq_file* m = (seq_file*) args->arg0;
-    int end = m->count;
-    // 检测maps是否符合我们的情况
-    char * line = vmalloc(end - start + 1);
-    // for (int i = 0; i < end - start; i++){
-    //     line[i] = m->buf[start + i];
-    // }
-    memcpy(line, m->buf + start, end - start);
-    line[end - start] = 0;
+    size_t start = (size_t)args->local.data0;
+    size_t end;
+    size_t len;
+    char *line;
 
-    // char *pos = strstr(m->buf + start, "rwxp");
-    char *pos1 = strstr(m->buf + start, "wwb_");
-    if (pos1 && pos1 < m->buf + end) {
-        // pos[1] = '-';  // rwxp -> r-xp
+    if (!m || !m->buf || !vmalloc || !vfree)
+        return;
+
+    end = m->count;
+    if (end <= start || end > m->size)
+        return;
+
+    len = end - start;
+    line = vmalloc(len + 1);
+    if (!line)
+        return;
+
+    memcpy(line, m->buf + start, len);
+    line[len] = '\0';
+
+    if (strstr(line, "wwb_")) {
         m->count = start;
     }
+
     vfree(line);
 }
 
@@ -64,41 +69,47 @@ void show_map_vma_after(hook_fargs2_t* args, void * udata){
  * @param reserved 
  * @return int 
  */
-static long hello_init(const char *args, const char *event, void *__user reserved)
+static long hide_maps_init(const char *args, const char *event, void *__user reserved)
 {
     (void)reserved;
-    kpm_demo_log_init("kpm hello", event, args);
+    kpm_demo_log_init("kpm-hide-maps", event, args);
 
     vmalloc = (void *)kallsyms_lookup_name("vmalloc");
     vfree = (void *)kallsyms_lookup_name("vfree");
-    pr_info("vmalloc: %p, vfree: %p\n", vmalloc, vfree);
+    if (!vmalloc || !vfree) {
+        pr_err("kpm-hide-maps: vmalloc/vfree not found: vmalloc=%p vfree=%p\n",
+               vmalloc, vfree);
+        return -1;
+    }
 
     show_map_vma = (void *)kallsyms_lookup_name("show_map_vma");
     if (show_map_vma) {
         hook_wrap2(show_map_vma, show_map_vma_before, show_map_vma_after, NULL);
-        pr_info("test_hide show_map_vma sucess %p", show_map_vma);
+        pr_info("kpm-hide-maps: hooked show_map_vma %p\n", show_map_vma);
     } else {
-        pr_info("test_hide show_map_vma fail");
+        pr_err("kpm-hide-maps: show_map_vma not found\n");
+        return -1;
     }
     return 0;
 }
 
 
 
-static long hello_control0(const char *args, char *__user out_msg, int outlen)
+static long hide_maps_control0(const char *args, char *__user out_msg, int outlen)
 {
-    return kpm_demo_echo_control("kpm hello", args, out_msg, outlen);
+    return kpm_demo_echo_control("kpm-hide-maps", args, out_msg, outlen);
 }
 
 
 
-static long hello_exit(void *__user reserved)
+static long hide_maps_exit(void *__user reserved)
 {
     (void)reserved;
-    unhook(show_map_vma);
-    return kpm_demo_log_exit("kpm hello");
+    if (show_map_vma)
+        unhook(show_map_vma);
+    return kpm_demo_log_exit("kpm-hide-maps");
 }
 
-KPM_INIT(hello_init);
-KPM_CTL0(hello_control0);
-KPM_EXIT(hello_exit);
+KPM_INIT(hide_maps_init);
+KPM_CTL0(hide_maps_control0);
+KPM_EXIT(hide_maps_exit);

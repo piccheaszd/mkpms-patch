@@ -21,15 +21,25 @@
 #include <errno.h>
 #include <getopt.h>
 #include <ctype.h>
+#include <limits.h>
 
 /* prctl options for wxshadow */
 #define PR_WXSHADOW_SET_BP      0x57580001
 #define PR_WXSHADOW_SET_REG     0x57580002
 #define PR_WXSHADOW_DEL_BP      0x57580003
+#define PR_WXSHADOW_SET_TLB_MODE 0x57580004
+#define PR_WXSHADOW_GET_TLB_MODE 0x57580005
 #define PR_WXSHADOW_PATCH       0x57580006
 #define PR_WXSHADOW_RELEASE     0x57580008
 
 #define MAX_REG_MODS 4
+
+enum wxshadow_tlb_mode {
+    WX_TLB_MODE_AUTO = 0,
+    WX_TLB_MODE_PRECISE,
+    WX_TLB_MODE_BROADCAST,
+    WX_TLB_MODE_FULL,
+};
 
 struct reg_mod {
     int reg_idx;
@@ -48,6 +58,8 @@ static void print_usage(const char *prog) {
     printf("  %s -p <pid> -a <addr> --patch <hex>   Patch shadow page\n", prog);
     printf("  %s -p <pid> -a <addr> --release       Release modification at addr\n", prog);
     printf("  %s -p <pid> --release                 Release ALL shadows\n", prog);
+    printf("  %s --tlb-mode <mode>                  Set TLB flush mode\n", prog);
+    printf("  %s --get-tlb-mode                     Show current TLB flush mode\n", prog);
     printf("\nOptions:\n");
     printf("  -p, --pid <pid>       Target process ID (0 for self)\n");
     printf("  -a, --addr <addr>     Virtual address (hex, optional for -d/--release)\n");
@@ -59,6 +71,8 @@ static void print_usage(const char *prog) {
     printf("  -m, --maps            Show executable memory regions\n");
     printf("  --patch <hex>         Patch shadow page with hex data (e.g. d503201f)\n");
     printf("  --release             Release modification at addr (all if no addr specified)\n");
+    printf("  --tlb-mode <mode>     TLB mode: auto, precise, broadcast, full, or 0-3\n");
+    printf("  --get-tlb-mode        Print current TLB mode\n");
     printf("  -h, --help            Show this help\n");
     printf("\nExamples:\n");
     printf("  %s -p 1234 -a 0x7b5c001234\n", prog);
@@ -69,6 +83,8 @@ static void print_usage(const char *prog) {
     printf("  %s -p 1234 -a 0x7b5c001234 --release\n", prog);
     printf("  %s -p 1234 -d                          # delete all BPs\n", prog);
     printf("  %s -p 1234 --release                   # release all shadows\n", prog);
+    printf("  %s --tlb-mode broadcast\n", prog);
+    printf("  %s --get-tlb-mode\n", prog);
 }
 
 static pid_t target_pid(pid_t pid)
@@ -103,15 +119,49 @@ static int run_wxshadow_prctl(const char *name, int option, pid_t pid,
     return 0;
 }
 
+static int parse_pid_arg(const char *str, pid_t *out)
+{
+    char *end = NULL;
+    long value;
+
+    errno = 0;
+    value = strtol(str, &end, 10);
+    if (errno != 0 || end == str || *end != '\0' || value < 0 || value > INT_MAX)
+        return -1;
+
+    *out = (pid_t)value;
+    return 0;
+}
+
+static int parse_ulong_arg(const char *str, unsigned long *out)
+{
+    char *end = NULL;
+    unsigned long value;
+
+    errno = 0;
+    value = strtoul(str, &end, 0);
+    if (errno != 0 || end == str || *end != '\0')
+        return -1;
+
+    *out = value;
+    return 0;
+}
+
 /* Parse register name to index */
 static int parse_reg_name(const char *name) {
+    char *end = NULL;
+    long idx;
+
     if (strcasecmp(name, "sp") == 0)
         return 31;
 
-    if (tolower(name[0]) == 'x') {
-        int idx = atoi(name + 1);
-        if (idx >= 0 && idx <= 30)
+    if (tolower((unsigned char)name[0]) == 'x' && name[1] != '\0') {
+        errno = 0;
+        idx = strtol(name + 1, &end, 10);
+        if (errno == 0 && end != name + 1 && *end == '\0' &&
+            idx >= 0 && idx <= 30) {
             return idx;
+        }
     }
 
     return -1;
@@ -136,7 +186,80 @@ static int parse_reg_mod(const char *str, struct reg_mod *mod) {
     if (mod->reg_idx < 0)
         return -1;
 
-    mod->value = strtoull(eq + 1, NULL, 0);
+    if (parse_ulong_arg(eq + 1, &mod->value) < 0)
+        return -1;
+
+    return 0;
+}
+
+static const char *tlb_mode_name(int mode)
+{
+    switch (mode) {
+    case WX_TLB_MODE_AUTO:
+        return "auto";
+    case WX_TLB_MODE_PRECISE:
+        return "precise";
+    case WX_TLB_MODE_BROADCAST:
+        return "broadcast";
+    case WX_TLB_MODE_FULL:
+        return "full";
+    default:
+        return "unknown";
+    }
+}
+
+static int parse_tlb_mode(const char *str, int *mode)
+{
+    unsigned long numeric;
+
+    if (strcasecmp(str, "auto") == 0) {
+        *mode = WX_TLB_MODE_AUTO;
+        return 0;
+    }
+    if (strcasecmp(str, "precise") == 0) {
+        *mode = WX_TLB_MODE_PRECISE;
+        return 0;
+    }
+    if (strcasecmp(str, "broadcast") == 0) {
+        *mode = WX_TLB_MODE_BROADCAST;
+        return 0;
+    }
+    if (strcasecmp(str, "full") == 0) {
+        *mode = WX_TLB_MODE_FULL;
+        return 0;
+    }
+
+    if (parse_ulong_arg(str, &numeric) == 0 && numeric <= WX_TLB_MODE_FULL) {
+        *mode = (int)numeric;
+        return 0;
+    }
+
+    return -1;
+}
+
+static int set_tlb_mode_cmd(int mode)
+{
+    if (prctl(PR_WXSHADOW_SET_TLB_MODE, mode, 0, 0, 0) < 0) {
+        fprintf(stderr, "prctl(SET_TLB_MODE) failed: %s (errno=%d)\n",
+                strerror(errno), errno);
+        return -1;
+    }
+
+    printf("TLB mode set to %s (%d)\n", tlb_mode_name(mode), mode);
+    return 0;
+}
+
+static int get_tlb_mode_cmd(void)
+{
+    int mode = prctl(PR_WXSHADOW_GET_TLB_MODE, 0, 0, 0, 0);
+
+    if (mode < 0) {
+        fprintf(stderr, "prctl(GET_TLB_MODE) failed: %s (errno=%d)\n",
+                strerror(errno), errno);
+        return -1;
+    }
+
+    printf("TLB mode: %s (%d)\n", tlb_mode_name(mode), mode);
     return 0;
 }
 
@@ -250,8 +373,8 @@ static int del_breakpoint(pid_t pid, unsigned long addr) {
 
 /* Parse hex string to binary data. Returns number of bytes, or -1 on error */
 static int parse_hex_string(const char *hex, unsigned char *out, int max_len) {
-    int len = strlen(hex);
-    int i, out_len;
+    size_t len = strlen(hex);
+    size_t i, out_len;
 
     if (len % 2 != 0) {
         fprintf(stderr, "Hex string must have even length\n");
@@ -260,20 +383,25 @@ static int parse_hex_string(const char *hex, unsigned char *out, int max_len) {
 
     out_len = len / 2;
     if (out_len > max_len) {
-        fprintf(stderr, "Hex data too long (%d bytes, max %d)\n", out_len, max_len);
+        fprintf(stderr, "Hex data too long (%zu bytes, max %d)\n", out_len, max_len);
         return -1;
     }
 
     for (i = 0; i < out_len; i++) {
         unsigned int byte;
+        if (!isxdigit((unsigned char)hex[i * 2]) ||
+            !isxdigit((unsigned char)hex[i * 2 + 1])) {
+            fprintf(stderr, "Invalid hex at position %zu\n", i * 2);
+            return -1;
+        }
         if (sscanf(hex + i * 2, "%2x", &byte) != 1) {
-            fprintf(stderr, "Invalid hex at position %d\n", i * 2);
+            fprintf(stderr, "Invalid hex at position %zu\n", i * 2);
             return -1;
         }
         out[i] = (unsigned char)byte;
     }
 
-    return out_len;
+    return (int)out_len;
 }
 
 /* Patch shadow page via prctl */
@@ -320,6 +448,8 @@ int main(int argc, char *argv[]) {
         {"maps",    no_argument,       0, 'm'},
         {"patch",   required_argument, 0, 'P'},
         {"release", no_argument,       0, 'L'},
+        {"tlb-mode", required_argument, 0, 'T'},
+        {"get-tlb-mode", no_argument,   0, 'G'},
         {"help",    no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
@@ -332,6 +462,9 @@ int main(int argc, char *argv[]) {
     int do_maps = 0;
     char *patch_hex = NULL;
     int do_release = 0;
+    int do_get_tlb_mode = 0;
+    int do_set_tlb_mode = 0;
+    int requested_tlb_mode = WX_TLB_MODE_AUTO;
     struct reg_mod reg_mods[MAX_REG_MODS];
     int nr_reg_mods = 0;
 
@@ -347,16 +480,25 @@ int main(int argc, char *argv[]) {
                               long_options, &option_index)) != -1) {
         switch (opt) {
         case 'p':
-            pid = atoi(optarg);
+            if (parse_pid_arg(optarg, &pid) < 0) {
+                fprintf(stderr, "Invalid pid: %s\n", optarg);
+                return 1;
+            }
             break;
         case 'a':
-            addr = strtoull(optarg, NULL, 0);
+            if (parse_ulong_arg(optarg, &addr) < 0) {
+                fprintf(stderr, "Invalid address: %s\n", optarg);
+                return 1;
+            }
             break;
         case 'b':
             lib_name = optarg;
             break;
         case 'o':
-            offset = strtoull(optarg, NULL, 0);
+            if (parse_ulong_arg(optarg, &offset) < 0) {
+                fprintf(stderr, "Invalid offset: %s\n", optarg);
+                return 1;
+            }
             break;
         case 'r':
             if (nr_reg_mods >= MAX_REG_MODS) {
@@ -383,6 +525,17 @@ int main(int argc, char *argv[]) {
         case 'L':
             do_release = 1;
             break;
+        case 'T':
+            if (parse_tlb_mode(optarg, &requested_tlb_mode) < 0) {
+                fprintf(stderr, "Invalid TLB mode: %s\n", optarg);
+                fprintf(stderr, "Expected auto, precise, broadcast, full, or 0-3\n");
+                return 1;
+            }
+            do_set_tlb_mode = 1;
+            break;
+        case 'G':
+            do_get_tlb_mode = 1;
+            break;
         case 'h':
             print_usage(argv[0]);
             return 0;
@@ -390,6 +543,19 @@ int main(int argc, char *argv[]) {
             print_usage(argv[0]);
             return 1;
         }
+    }
+
+    if (do_set_tlb_mode || do_get_tlb_mode) {
+        if (do_set_tlb_mode && set_tlb_mode_cmd(requested_tlb_mode) < 0)
+            return 1;
+        if (do_get_tlb_mode)
+            return get_tlb_mode_cmd() < 0 ? 1 : 0;
+        return 0;
+    }
+
+    if ((patch_hex != NULL) + do_release + do_delete > 1) {
+        fprintf(stderr, "--patch, --release, and --delete are mutually exclusive\n");
+        return 1;
     }
 
     /* Show maps mode */

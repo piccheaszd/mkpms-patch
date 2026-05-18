@@ -476,7 +476,7 @@ static int write_shadow_bytes(struct wxshadow_page *page_info,
     unsigned long shadow_vaddr;
 
     if (!page_info || !page_info->shadow_page || !src || len == 0 ||
-        offset + len > PAGE_SIZE)
+        offset >= PAGE_SIZE || len > PAGE_SIZE - offset)
         return -22;  /* EINVAL */
 
     shadow_vaddr = (unsigned long)page_info->shadow_page;
@@ -586,7 +586,7 @@ static int wxshadow_rebuild_shadow_range(struct wxshadow_page *page_info,
         return -22;
     if (len == 0)
         return 0;
-    if (offset >= PAGE_SIZE || offset + len > PAGE_SIZE)
+    if (offset >= PAGE_SIZE || len > PAGE_SIZE - offset)
         return -22;
 
     /* Pre-read counts to size the ops array (allocated outside lock) */
@@ -910,6 +910,11 @@ int wxshadow_do_set_bp(void *mm, unsigned long addr)
 
     wx_info("wxshadow: [set_bp] addr=%lx\n", addr);
 
+    if (addr & (AARCH64_INSN_SIZE - 1)) {
+        pr_err("wxshadow: [set_bp] unaligned breakpoint address: %lx\n", addr);
+        return -22;  /* EINVAL */
+    }
+
     ret = wxshadow_acquire_write_ctx(mm, addr, "set_bp", &ctx);
     if (ret < 0)
         return ret;
@@ -1034,7 +1039,7 @@ static void *copy_from_user_via_pte(void __user *ubuf, unsigned long len)
     unsigned long buf_pfn;
     void *buf_kaddr, *kbuf;
 
-    if (buf_off + len > PAGE_SIZE) {
+    if (len > PAGE_SIZE - buf_off) {
         pr_err("wxshadow: user buffer %lx+%lu crosses page boundary\n", uaddr, len);
         return NULL;
     }
@@ -1088,7 +1093,7 @@ int wxshadow_do_patch(void *mm, unsigned long addr, void __user *buf, unsigned l
 
     wx_info("wxshadow: [patch] addr=%lx len=%lu\n", addr, len);
 
-    if (len == 0 || offset + len > PAGE_SIZE) {
+    if (len == 0 || offset >= PAGE_SIZE || len > PAGE_SIZE - offset) {
         pr_err("wxshadow: [patch] invalid len=%lu offset=%lu\n", len, offset);
         return -22;  /* EINVAL */
     }

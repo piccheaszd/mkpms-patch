@@ -14,6 +14,15 @@ endif()
 set(CMAKE_C_FLAGS_RELEASE "-DNDEBUG -g0" CACHE STRING "Release flags" FORCE)
 set(CMAKE_C_FLAGS_RELWITHDEBINFO "-DNDEBUG -g0" CACHE STRING "RelWithDebInfo flags" FORCE)
 
+set(KPM_RELOCATE_FLAGS "" CACHE STRING
+    "Extra flags passed to the compiler when producing relocatable .kpm files")
+if(CMAKE_C_COMPILER_TARGET AND NOT KPM_RELOCATE_FLAGS)
+    list(APPEND KPM_RELOCATE_FLAGS "--target=${CMAKE_C_COMPILER_TARGET}")
+    if(CMAKE_C_COMPILER_ID MATCHES "Clang")
+        list(APPEND KPM_RELOCATE_FLAGS "-fuse-ld=lld")
+    endif()
+endif()
+
 # 设置全局包含目录
 set(KERNEL_INCLUDE_DIRS
         .
@@ -68,7 +77,7 @@ function(add_kpm_module MODULE_NAME)
 
 
     add_custom_target(${MODULE_NAME}.kpm ALL
-            COMMAND ${CMAKE_C_COMPILER} -r -o ${MODULE_NAME}.kpm "$<TARGET_OBJECTS:${MODULE_NAME}_obj>"
+            COMMAND ${CMAKE_C_COMPILER} ${KPM_RELOCATE_FLAGS} -r -o ${MODULE_NAME}.kpm "$<TARGET_OBJECTS:${MODULE_NAME}_obj>"
             DEPENDS ${MODULE_NAME}_obj
             COMMENT "Generating ${MODULE_NAME}.kpm"
             WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
@@ -100,5 +109,3 @@ foreach(child ${CHILD_MODULES})
         add_subdirectory(kpms/${child})
     endif()
 endforeach()
-
-
