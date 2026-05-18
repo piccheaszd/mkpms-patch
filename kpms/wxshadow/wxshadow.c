@@ -17,7 +17,7 @@
 #endif
 
 KPM_NAME("wxshadow");
-KPM_VERSION("1.1.1");
+KPM_VERSION("1.1.2");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("wxshadow");
 KPM_DESCRIPTION("W^X Shadow Memory - Hidden Breakpoint Mechanism");

@@ -365,45 +365,45 @@ static inline u64 mm_get_asid(void *mm)
  *
  * TLBI operand format: {ASID[63:48], VA[47:12]}
  */
-static void wxshadow_tlbi_page(void *mm, unsigned long uaddr)
+static void wxshadow_tlbi_page_mode(void *mm, unsigned long uaddr, int mode)
 {
     u64 asid = mm_get_asid(mm);
     u64 tlbi_val;
-    int mode = tlb_flush_mode;
-    const char *mode_str;
 
     /* Build TLBI operand: ASID in bits [63:48], VA>>12 in bits [43:0] */
     tlbi_val = (asid << 48) | ((uaddr >> 12) & 0xFFFFFFFFFFFFUL);
+
+    /* Ensure the PTE write is visible before invalidating stale translations. */
+    asm volatile("dsb ishst" : : : "memory");
 
     switch (mode) {
     case WX_TLB_MODE_PRECISE:
         /* Force precise mode - use ASID even if 0 (may not work correctly) */
         asm volatile("tlbi vale1is, %0" : : "r"(tlbi_val) : "memory");
-        mode_str = "precise";
         break;
 
     case WX_TLB_MODE_BROADCAST:
         /* Force broadcast mode - flush all ASIDs for this VA */
         asm volatile("tlbi vaale1is, %0" : : "r"(uaddr >> 12) : "memory");
-        mode_str = "broadcast";
         break;
 
     case WX_TLB_MODE_FULL:
         /* Full TLB flush - most expensive but guaranteed to work */
         asm volatile("tlbi vmalle1is" : : : "memory");
-        mode_str = "full";
         break;
 
     case WX_TLB_MODE_AUTO:
     default:
-        /* Auto mode: use ASID if available, else broadcast */
-        if (asid != 0) {
-            asm volatile("tlbi vale1is, %0" : : "r"(tlbi_val) : "memory");
-            mode_str = "auto-precise";
-        } else {
-            asm volatile("tlbi vaale1is, %0" : : "r"(uaddr >> 12) : "memory");
-            mode_str = "auto-broadcast";
-        }
+        /*
+         * Auto mode intentionally uses VA-all-ASID invalidation here.
+         * Some Android vendor kernels expose a flush_tlb_page symbol that is
+         * callable from KPM context but does not reliably invalidate the target
+         * EL0 instruction-side translation after our manual PTE rewrite.
+         * Broadcast TLBI is slower than precise ASID TLBI, but hook install and
+         * BRK stepping are correctness-sensitive and sparse enough to prefer the
+         * robust path.
+         */
+        asm volatile("tlbi vaale1is, %0" : : "r"(uaddr >> 12) : "memory");
         break;
     }
 
@@ -422,6 +422,14 @@ static void wxshadow_tlbi_page(void *mm, unsigned long uaddr)
  */
 void wxshadow_flush_tlb_page(void *vma, unsigned long uaddr)
 {
+    void *mm = vma ? vma_mm(vma) : NULL;
+    int mode = tlb_flush_mode;
+
+    if (mode != WX_TLB_MODE_AUTO) {
+        wxshadow_tlbi_page_mode(mm, uaddr, mode);
+        return;
+    }
+
     if (kfunc_flush_tlb_page) {
         kfunc_flush_tlb_page(vma, uaddr);
     } else if (kfunc___flush_tlb_range) {
@@ -430,11 +438,14 @@ void wxshadow_flush_tlb_page(void *vma, unsigned long uaddr)
          * tlb_level=3: PTE level for 4K pages
          */
         kfunc___flush_tlb_range(vma, uaddr, uaddr + PAGE_SIZE, PAGE_SIZE, true, 3);
-    } else {
-        /* Final fallback: use TLBI instruction directly */
-        void *mm = vma ? vma_mm(vma) : NULL;
-        wxshadow_tlbi_page(mm, uaddr);
     }
+
+    /*
+     * Backstop the kernel helper with broadcast TLBI.  This keeps AUTO reliable
+     * on vendor kernels whose exported helper does not affect the active user
+     * ASID from this call context.
+     */
+    wxshadow_tlbi_page_mode(mm, uaddr, WX_TLB_MODE_AUTO);
 }
 
 /* Build a PTE value */

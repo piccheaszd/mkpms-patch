@@ -1,5 +1,12 @@
 # WXSHADOW Changelog
 
+## [1.1.2] - 2026-05-18
+
+### Fixed
+
+- Made AUTO TLB flushing robust on vendor kernels by backstopping exported kernel flush helpers with broadcast `TLBI VAALE1IS` after wxshadow PTE switches. This avoids stale user execute translations after hidden patch activation.
+- Added a `DSB ISHST` barrier before direct TLBI invalidation so PTE writes are visible before stale translations are dropped.
+
 ## [1.1.1] - 2026-05-15
 
 ### Fixed
