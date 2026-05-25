@@ -22,7 +22,7 @@
 #include "../common/kpm_demo_helpers.h"
 
 KPM_MODULE_INFO("anti-detect",
-                "1.2.9",
+                "1.2.15",
                 "GPL v2",
                 "wwb",
                 "Hide emulator, KernelPatch, and instrumentation artifacts from apps");
@@ -68,6 +68,7 @@ static char *(*kfn_d_path)(const void *path, char *buf, int buflen);
 #define VMA_VM_FILE_OFFSET  0x88
 #define FILE_F_PATH_OFFSET  0x10
 #define CALLER_PATH_BUF_SIZE 1024
+#define READ_SANITIZE_MAX (64 * 1024)
 #define MAX_ERRNO_VALUE 4095UL
 
 struct linux_dirent64 {
@@ -148,6 +149,14 @@ static const char * const hidden_link_tokens[] = {
     NULL,
 };
 
+static const char * const self_protect_loader_tokens[] = {
+    "libxloader.so",
+    "libbochk_aos.so",
+    NULL,
+};
+
+static uid_t lsposed_manager_uid = (uid_t)-1;
+
 static int contains_any_token(const char *name, const char * const *tokens)
 {
     for (const char * const *p = tokens; *p; p++) {
@@ -157,13 +166,51 @@ static int contains_any_token(const char *name, const char * const *tokens)
     return 0;
 }
 
+static int task_comm_contains(struct task_struct *task, const char *token)
+{
+    const char *comm;
+
+    if (!task || !token)
+        return 0;
+
+    comm = get_task_comm(task);
+    return comm && strstr(comm, token);
+}
+
+static int current_is_lsposed_manager(void)
+{
+    uid_t uid = current_uid();
+
+    if (uid == lsposed_manager_uid)
+        return 1;
+
+    if (task_comm_contains(current, "lsposed.manager") ||
+        task_comm_contains(current, "org.lsposed")) {
+        lsposed_manager_uid = uid;
+        return 1;
+    }
+
+    return 0;
+}
+
+static int current_may_see_hidden_artifacts(void)
+{
+    return current_is_lsposed_manager();
+}
+
 static int should_hide_path(const char *name)
 {
+    if (current_may_see_hidden_artifacts())
+        return 0;
+
     return contains_any_token(name, hidden_path_tokens);
 }
 
 static int should_hide_link_target(const char *name)
 {
+    if (current_may_see_hidden_artifacts())
+        return 0;
+
     return contains_any_token(name, hidden_link_tokens);
 }
 
@@ -285,6 +332,80 @@ static void after_getdents64(hook_fargs4_t *args, void *udata)
     kfn_kfree(kbuf);
 }
 
+static int sanitize_tracerpid_line(char *buf, long len)
+{
+    char *p = buf;
+    char *end = buf + len;
+    int changed = 0;
+
+    while (p < end && (p = strstr(p, "TracerPid:")) != NULL) {
+        char *line_end = p;
+        char *digits;
+        int nonzero = 0;
+
+        while (line_end < end && *line_end && *line_end != '\n')
+            line_end++;
+
+        digits = p + strlen("TracerPid:");
+        while (digits < line_end && (*digits == ' ' || *digits == '\t'))
+            digits++;
+
+        if (digits >= line_end || *digits < '0' || *digits > '9') {
+            p = line_end + (line_end < end);
+            continue;
+        }
+
+        for (char *q = digits; q < line_end && *q >= '0' && *q <= '9'; q++) {
+            if (*q != '0')
+                nonzero = 1;
+        }
+
+        if (nonzero) {
+            *digits++ = '0';
+            while (digits < line_end && *digits >= '0' && *digits <= '9')
+                *digits++ = ' ';
+            changed = 1;
+        }
+
+        p = line_end + (line_end < end);
+    }
+
+    return changed;
+}
+
+static void after_read_syscall(hook_fargs3_t *args, void *udata)
+{
+    uid_t uid = current_uid();
+    long ret = (long)args->ret;
+    char __user *ubuf;
+    char *kbuf;
+
+    if (uid < AID_APP_START || ret <= 0 || ret > READ_SANITIZE_MAX)
+        return;
+
+    ubuf = (char __user *)syscall_argn(args, 1);
+    if (!ubuf)
+        return;
+
+    kbuf = kfn_kmalloc(ret + 1, GFP_KERNEL_VAL);
+    if (!kbuf)
+        return;
+
+    if (kfn_copy_from_user(kbuf, ubuf, ret)) {
+        kfn_kfree(kbuf);
+        return;
+    }
+    kbuf[ret] = '\0';
+
+    if (sanitize_tracerpid_line(kbuf, ret)) {
+        if (compat_copy_to_user(ubuf, kbuf, ret) == ret)
+            pr_info("anti-detect: sanitized TracerPid for comm=%s uid=%u\n",
+                    get_task_comm(current), uid);
+    }
+
+    kfn_kfree(kbuf);
+}
+
 static void before_ptrace_syscall(hook_fargs4_t *args, void *udata)
 {
     uid_t uid = current_uid();
@@ -391,18 +512,57 @@ out_mm:
     return matched;
 }
 
-static int classify_xloader_exit(long nr, long status, const char *comm,
-                                 unsigned long pc, unsigned long lr)
+static int caller_addr_matches_any_path_token(unsigned long addr,
+                                              const char * const *tokens)
 {
-    if (nr != __NR_exit_group || status != 0)
+    for (const char * const *p = tokens; *p; p++) {
+        if (caller_addr_matches_path_token(addr, *p))
+            return 1;
+    }
+
+    return 0;
+}
+
+static int caller_matches_self_protect_loader(unsigned long pc, unsigned long lr)
+{
+    return caller_addr_matches_any_path_token(lr, self_protect_loader_tokens) ||
+           caller_addr_matches_any_path_token(pc, self_protect_loader_tokens);
+}
+
+static int is_self_protect_exit_status(long status)
+{
+    return status == 0 || status == 1 || status == 255 ||
+           (unsigned long)status == 0xffffffffUL;
+}
+
+static int classify_self_protect_exit(long nr, long status, const char *comm,
+                                      unsigned long pc, unsigned long lr)
+{
+    if (nr != __NR_exit && nr != __NR_exit_group)
         return 0;
 
-    if (caller_addr_matches_path_token(lr, "libxloader.so") ||
-        caller_addr_matches_path_token(pc, "libxloader.so"))
+    if (is_self_protect_exit_status(status) &&
+        caller_matches_self_protect_loader(pc, lr))
         return 1;
 
-    if (comm && strstr(comm, "mo.client") && ((lr & 0xffffUL) == 0xe120UL))
+    if (status == 0 && comm && strstr(comm, "mo.client") && ((lr & 0xffffUL) == 0xe120UL))
         return 2;
+
+    return 0;
+}
+
+static int is_fatal_signal(long sig)
+{
+    return sig == 6 || sig == 9 || sig == 15;
+}
+
+static int classify_self_protect_kill(long sig, unsigned long pc, unsigned long lr)
+{
+    if (!is_fatal_signal(sig))
+        return 0;
+
+    if (caller_matches_self_protect_loader(pc, lr))
+        return 3;
 
     return 0;
 }
@@ -427,11 +587,49 @@ static void before_exit_syscall(hook_fargs1_t *args, void *udata)
     const char *comm = get_task_comm(current);
     unsigned long pc = (unsigned long)regs->pc;
     unsigned long lr = (unsigned long)regs->regs[30];
-    int xloader_reason = classify_xloader_exit(nr, status, comm, pc, lr);
+    int self_protect_reason = classify_self_protect_exit(nr, status, comm, pc, lr);
 
-    if (xloader_reason) {
-        pr_info("anti-detect: bypass xloader exit_group comm=%s pc=%lx lr=%lx reason=%d\n",
-                comm ? comm : "<null>", pc, lr, xloader_reason);
+    if (self_protect_reason) {
+        pr_info("anti-detect: bypass self-protect exit nr=%ld status=%ld comm=%s pc=%lx lr=%lx reason=%d\n",
+                nr, status, comm ? comm : "<null>", pc, lr, self_protect_reason);
+        args->ret = 0;
+        args->skip_origin = 1;
+    }
+}
+
+static void before_kill_syscall(hook_fargs4_t *args, void *udata)
+{
+    uid_t uid = current_uid();
+    if (uid < AID_APP_START)
+        return;
+
+    struct pt_regs *regs = NULL;
+    long nr = -1;
+    long target = (long)syscall_argn(args, 0);
+    long sig = (long)syscall_argn(args, 1);
+    long tid = -1;
+
+    if (has_syscall_wrapper)
+        regs = (struct pt_regs *)((hook_fargs0_t *)args)->args[0];
+    if (regs)
+        nr = regs->syscallno;
+
+    if (!regs || !user_mode(regs))
+        return;
+
+    if (nr == __NR_tgkill || nr == __NR_rt_tgsigqueueinfo) {
+        tid = (long)syscall_argn(args, 1);
+        sig = (long)syscall_argn(args, 2);
+    }
+
+    const char *comm = get_task_comm(current);
+    unsigned long pc = (unsigned long)regs->pc;
+    unsigned long lr = (unsigned long)regs->regs[30];
+    int reason = classify_self_protect_kill(sig, pc, lr);
+
+    if (reason) {
+        pr_info("anti-detect: bypass self-protect kill nr=%ld target=%ld tid=%ld sig=%ld comm=%s pc=%lx lr=%lx reason=%d\n",
+                nr, target, tid, sig, comm ? comm : "<null>", pc, lr, reason);
         args->ret = 0;
         args->skip_origin = 1;
     }
@@ -477,9 +675,9 @@ static int resolve_symbols(void)
             kfn_kmalloc, kfn_kfree, kfn_copy_from_user);
     if (kfn_copy_from_kernel_nofault && kfn_find_vma && kfn_get_task_mm &&
         kfn_mmput && kfn_d_path) {
-        pr_info("anti-detect: xloader caller path detection enabled\n");
+        pr_info("anti-detect: self-protect caller path detection enabled\n");
     } else {
-        pr_warn("anti-detect: xloader caller path detection disabled: nofault=%px find_vma=%px get_task_mm=%px mmput=%px d_path=%px\n",
+        pr_warn("anti-detect: self-protect caller path detection disabled: nofault=%px find_vma=%px get_task_mm=%px mmput=%px d_path=%px\n",
                 kfn_copy_from_kernel_nofault, kfn_find_vma, kfn_get_task_mm,
                 kfn_mmput, kfn_d_path);
     }
@@ -502,12 +700,20 @@ static const struct syscall_hook hooks[] = {
     { __NR_readlinkat,    4, before_stat_syscall, after_readlinkat_syscall },
     /* getdents64 - filter output */
     { __NR_getdents64,    3, 0, after_getdents64 },
+    /* proc status - hide self ptrace parent from app reads */
+    { __NR_read,          3, 0, after_read_syscall },
     /* native anti-debug probes */
     { __NR_ptrace,        4, before_ptrace_syscall, 0 },
     { __NR_prctl,         5, before_prctl_syscall, 0 },
-    /* libxloader self-exit bypass */
+    /* native loader self-exit bypass */
     { __NR_exit,          1, before_exit_syscall, 0 },
     { __NR_exit_group,    1, before_exit_syscall, 0 },
+    { __NR_kill,          2, before_kill_syscall, 0 },
+    { __NR_tkill,         2, before_kill_syscall, 0 },
+    { __NR_tgkill,        3, before_kill_syscall, 0 },
+    { __NR_rt_sigqueueinfo, 3, before_kill_syscall, 0 },
+    { __NR_rt_tgsigqueueinfo, 4, before_kill_syscall, 0 },
+    { __NR_pidfd_send_signal, 4, before_kill_syscall, 0 },
 };
 
 #define NUM_HOOKS (sizeof(hooks) / sizeof(hooks[0]))

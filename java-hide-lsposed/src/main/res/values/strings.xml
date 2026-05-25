@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">Java Hide</string>
+    <string name="xposed_description">Hide Java/ART-visible hook artifacts in selected apps</string>
+</resources>
