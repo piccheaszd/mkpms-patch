@@ -22,7 +22,7 @@
 #include "../common/kpm_demo_helpers.h"
 
 KPM_MODULE_INFO("anti-detect",
-                "1.2.8",
+                "1.2.9",
                 "GPL v2",
                 "wwb",
                 "Hide emulator, KernelPatch, and instrumentation artifacts from apps");
@@ -50,9 +50,25 @@ extern void supercall_guard_exit(void);
 static void *(*kfn_kmalloc)(size_t size, unsigned int flags);
 static void (*kfn_kfree)(const void *ptr);
 static unsigned long (*kfn_copy_from_user)(void *to, const void __user *from, unsigned long n);
+static long (*kfn_copy_from_kernel_nofault)(void *dst, const void *src, size_t size);
+static void *(*kfn_find_vma)(void *mm, unsigned long addr);
+static void *(*kfn_get_task_mm)(void *task);
+static void (*kfn_mmput)(void *mm);
+static char *(*kfn_d_path)(const void *path, char *buf, int buflen);
 
 /* GFP_KERNEL = 0xcc0 on most kernels */
 #define GFP_KERNEL_VAL 0xcc0
+
+/*
+ * Offsets confirmed from this device's BTF
+ * (6.1.75-android14-11-o-g7cddc8f99e91).
+ */
+#define VMA_VM_START_OFFSET 0x00
+#define VMA_VM_END_OFFSET   0x08
+#define VMA_VM_FILE_OFFSET  0x88
+#define FILE_F_PATH_OFFSET  0x10
+#define CALLER_PATH_BUF_SIZE 1024
+#define MAX_ERRNO_VALUE 4095UL
 
 struct linux_dirent64 {
     uint64_t       d_ino;
@@ -291,6 +307,106 @@ static void before_prctl_syscall(hook_fargs5_t *args, void *udata)
     }
 }
 
+static int is_err_ptr(const void *ptr)
+{
+    return (unsigned long)ptr >= (unsigned long)-MAX_ERRNO_VALUE;
+}
+
+static int looks_like_kernel_ptr(const void *ptr)
+{
+    return ptr && ((long)ptr < 0);
+}
+
+static int read_kernel_field(const void *addr, void *out, size_t size)
+{
+    if (!kfn_copy_from_kernel_nofault || !addr || !out)
+        return 0;
+
+    return kfn_copy_from_kernel_nofault(out, addr, size) == 0;
+}
+
+static int read_kernel_ulong_field(const void *base, unsigned long offset,
+                                   unsigned long *out)
+{
+    return read_kernel_field((const char *)base + offset, out, sizeof(*out));
+}
+
+static int read_kernel_ptr_field(const void *base, unsigned long offset,
+                                 void **out)
+{
+    return read_kernel_field((const char *)base + offset, out, sizeof(*out));
+}
+
+static int caller_addr_matches_path_token(unsigned long addr, const char *token)
+{
+    void *mm;
+    void *vma;
+    void *file = NULL;
+    unsigned long start = 0;
+    unsigned long end = 0;
+    char *buf = NULL;
+    char *path;
+    int matched = 0;
+
+    if (!addr || !token || !kfn_find_vma || !kfn_get_task_mm || !kfn_mmput ||
+        !kfn_d_path || !kfn_kmalloc || !kfn_kfree ||
+        !kfn_copy_from_kernel_nofault)
+        return 0;
+
+    mm = kfn_get_task_mm(current);
+    if (!mm)
+        return 0;
+
+    vma = kfn_find_vma(mm, addr);
+    if (!vma)
+        goto out_mm;
+
+    if (!read_kernel_ulong_field(vma, VMA_VM_START_OFFSET, &start) ||
+        !read_kernel_ulong_field(vma, VMA_VM_END_OFFSET, &end) ||
+        start > addr || end <= addr)
+        goto out_mm;
+
+    if (!read_kernel_ptr_field(vma, VMA_VM_FILE_OFFSET, &file) ||
+        !looks_like_kernel_ptr(file))
+        goto out_mm;
+
+    buf = kfn_kmalloc(CALLER_PATH_BUF_SIZE, GFP_KERNEL_VAL);
+    if (!buf)
+        goto out_mm;
+
+    path = kfn_d_path((const char *)file + FILE_F_PATH_OFFSET,
+                      buf, CALLER_PATH_BUF_SIZE);
+    if (!is_err_ptr(path)) {
+        unsigned long p = (unsigned long)path;
+        unsigned long b = (unsigned long)buf;
+
+        if (p >= b && p < b + CALLER_PATH_BUF_SIZE)
+            matched = strstr(path, token) != NULL;
+    }
+
+    kfn_kfree(buf);
+
+out_mm:
+    kfn_mmput(mm);
+    return matched;
+}
+
+static int classify_xloader_exit(long nr, long status, const char *comm,
+                                 unsigned long pc, unsigned long lr)
+{
+    if (nr != __NR_exit_group || status != 0)
+        return 0;
+
+    if (caller_addr_matches_path_token(lr, "libxloader.so") ||
+        caller_addr_matches_path_token(pc, "libxloader.so"))
+        return 1;
+
+    if (comm && strstr(comm, "mo.client") && ((lr & 0xffffUL) == 0xe120UL))
+        return 2;
+
+    return 0;
+}
+
 static void before_exit_syscall(hook_fargs1_t *args, void *udata)
 {
     uid_t uid = current_uid();
@@ -311,12 +427,11 @@ static void before_exit_syscall(hook_fargs1_t *args, void *udata)
     const char *comm = get_task_comm(current);
     unsigned long pc = (unsigned long)regs->pc;
     unsigned long lr = (unsigned long)regs->regs[30];
+    int xloader_reason = classify_xloader_exit(nr, status, comm, pc, lr);
 
-    if (nr == __NR_exit_group && status == 0 &&
-        comm && strstr(comm, "mo.client") &&
-        ((lr & 0xffffUL) == 0xe120UL)) {
-        pr_info("anti-detect: paic bypass exit_group comm=%s pc=%lx lr=%lx\n",
-                comm, pc, lr);
+    if (xloader_reason) {
+        pr_info("anti-detect: bypass xloader exit_group comm=%s pc=%lx lr=%lx reason=%d\n",
+                comm ? comm : "<null>", pc, lr, xloader_reason);
         args->ret = 0;
         args->skip_origin = 1;
     }
@@ -351,8 +466,23 @@ static int resolve_symbols(void)
         return -1;
     }
 
+    kfn_copy_from_kernel_nofault = (typeof(kfn_copy_from_kernel_nofault))
+        kallsyms_lookup_name("copy_from_kernel_nofault");
+    kfn_find_vma = (typeof(kfn_find_vma))kallsyms_lookup_name("find_vma");
+    kfn_get_task_mm = (typeof(kfn_get_task_mm))kallsyms_lookup_name("get_task_mm");
+    kfn_mmput = (typeof(kfn_mmput))kallsyms_lookup_name("mmput");
+    kfn_d_path = (typeof(kfn_d_path))kallsyms_lookup_name("d_path");
+
     pr_info("anti-detect: symbols resolved: kmalloc=%px kfree=%px copy_from_user=%px\n",
             kfn_kmalloc, kfn_kfree, kfn_copy_from_user);
+    if (kfn_copy_from_kernel_nofault && kfn_find_vma && kfn_get_task_mm &&
+        kfn_mmput && kfn_d_path) {
+        pr_info("anti-detect: xloader caller path detection enabled\n");
+    } else {
+        pr_warn("anti-detect: xloader caller path detection disabled: nofault=%px find_vma=%px get_task_mm=%px mmput=%px d_path=%px\n",
+                kfn_copy_from_kernel_nofault, kfn_find_vma, kfn_get_task_mm,
+                kfn_mmput, kfn_d_path);
+    }
     return 0;
 }
 
@@ -375,7 +505,7 @@ static const struct syscall_hook hooks[] = {
     /* native anti-debug probes */
     { __NR_ptrace,        4, before_ptrace_syscall, 0 },
     { __NR_prctl,         5, before_prctl_syscall, 0 },
-    /* PAIC libxloader self-exit bypass */
+    /* libxloader self-exit bypass */
     { __NR_exit,          1, before_exit_syscall, 0 },
     { __NR_exit_group,    1, before_exit_syscall, 0 },
 };
