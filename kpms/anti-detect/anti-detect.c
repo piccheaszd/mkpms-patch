@@ -13,6 +13,7 @@
 #include <uapi/asm-generic/unistd.h>
 #include <linux/uaccess.h>
 #include <linux/string.h>
+#include <linux/sched.h>
 #include <syscall.h>
 #include <kputils.h>
 #include <kallsyms.h>
@@ -21,7 +22,7 @@
 #include "../common/kpm_demo_helpers.h"
 
 KPM_MODULE_INFO("anti-detect",
-                "1.2.1",
+                "1.2.8",
                 "GPL v2",
                 "wwb",
                 "Hide emulator, KernelPatch, and instrumentation artifacts from apps");
@@ -35,6 +36,14 @@ extern void supercall_guard_exit(void);
 
 #ifndef __NR_faccessat2
 #define __NR_faccessat2 439
+#endif
+
+#ifndef PTRACE_TRACEME
+#define PTRACE_TRACEME 0
+#endif
+
+#ifndef PR_GET_DUMPABLE
+#define PR_GET_DUMPABLE 3
 #endif
 
 /* Resolved kernel functions */
@@ -53,37 +62,93 @@ struct linux_dirent64 {
     char           d_name[];
 };
 
-static const char *hidden_names[] = {
+static const char * const hidden_path_tokens[] = {
     "goldfish_",
     "wwb_",
-    "frida",
-    "Frida",
+    "frida-server",
+    "frida-helper",
+    "frida-agent",
+    "frida-gadget",
+    "libfrida",
+    "re.frida.server",
     "rustfrida",
     "rustFrida",
     "rust_frida",
     "rf_test",
-    "gum-js-loop",
-    "gmain",
-    "gdbus",
     "linjector",
     "/data/local/tmp/rf_",
     "/data/local/tmp/frida",
-    "memfd:rust",
-    "memfd:agent",
-    "memfd:frida",
-    "[anon:rust",
-    "[anon:frida",
-    "[anon:agent",
+    "xposed",
+    "Xposed",
+    "lsposed",
+    "LSPosed",
+    "lspd",
+    "org.lsposed",
+    "liblspd",
+    "riru",
+    "Riru",
+    "edxp",
+    "EdXposed",
+    "libriru_edxp",
+    "lspatch",
+    "LSPatch",
+    "yukihook",
+    "YukiHook",
+    "com.highcapable.yukihookapi",
+    "anydebug",
+    "AnyDebug",
+    "com.hhvvg.anydebug",
     NULL,
 };
 
-static int should_hide(const char *name)
+static const char * const hidden_link_tokens[] = {
+    "wwb_",
+    "memfd:rust",
+    "memfd:frida",
+    "[anon:rust",
+    "[anon:frida",
+    "/data/local/tmp/rf_",
+    "/data/local/tmp/frida",
+    "xposed",
+    "Xposed",
+    "lsposed",
+    "LSPosed",
+    "lspd",
+    "org.lsposed",
+    "liblspd",
+    "riru",
+    "Riru",
+    "edxp",
+    "EdXposed",
+    "libriru_edxp",
+    "lspatch",
+    "LSPatch",
+    "yukihook",
+    "YukiHook",
+    "com.highcapable.yukihookapi",
+    "anydebug",
+    "AnyDebug",
+    "com.hhvvg.anydebug",
+    NULL,
+};
+
+static int contains_any_token(const char *name, const char * const *tokens)
 {
-    for (const char **p = hidden_names; *p; p++) {
+    for (const char * const *p = tokens; *p; p++) {
         if (strstr(name, *p))
             return 1;
     }
     return 0;
+}
+
+static int should_hide_path(const char *name)
+{
+    return contains_any_token(name, hidden_path_tokens);
+}
+
+static int should_hide_link_target(const char *name)
+{
+    return contains_any_token(name, hidden_link_tokens);
 }
 
 /* Block stat/access/readlink for hidden files */
@@ -97,7 +162,7 @@ static void before_stat_syscall(hook_fargs4_t *args, void *udata)
     long len = compat_strncpy_from_user(buf, ufilename, sizeof(buf));
     if (len <= 0) return;
 
-    if (should_hide(buf)) {
+    if (should_hide_path(buf)) {
         args->ret = -ENOENT;
         args->skip_origin = 1;
     }
@@ -123,7 +188,7 @@ static void after_readlinkat_syscall(hook_fargs4_t *args, void *udata)
         return;
     buf[n] = '\0';
 
-    if (should_hide(buf)) {
+    if (should_hide_link_target(buf)) {
         char empty = '\0';
         compat_copy_to_user(ubuf, &empty, 1);
         args->ret = -ENOENT;
@@ -143,7 +208,7 @@ static int getdents_has_hidden(char __user *ubuf, long len)
             return 0;
         if (reclen == 0 || pos + reclen > end) break;
         long nlen = compat_strncpy_from_user(name, pos + offsetof(struct linux_dirent64, d_name), sizeof(name));
-        if (nlen > 0 && should_hide(name))
+        if (nlen > 0 && should_hide_path(name))
             return 1;
         pos += reclen;
     }
@@ -187,7 +252,7 @@ static void after_getdents64(hook_fargs4_t *args, void *udata)
         unsigned short reclen = d->d_reclen;
         if (reclen == 0 || src + reclen > end) break;
 
-        if (!should_hide(d->d_name)) {
+        if (!should_hide_path(d->d_name)) {
             if (dst != src)
                 memmove(dst, src, reclen);
             dst += reclen;
@@ -202,6 +267,59 @@ static void after_getdents64(hook_fargs4_t *args, void *udata)
     }
 
     kfn_kfree(kbuf);
+}
+
+static void before_ptrace_syscall(hook_fargs4_t *args, void *udata)
+{
+    uid_t uid = current_uid();
+    if (uid < AID_APP_START) return;
+
+    if ((long)syscall_argn(args, 0) == PTRACE_TRACEME) {
+        args->ret = 0;
+        args->skip_origin = 1;
+    }
+}
+
+static void before_prctl_syscall(hook_fargs5_t *args, void *udata)
+{
+    uid_t uid = current_uid();
+    if (uid < AID_APP_START) return;
+
+    if ((long)syscall_argn(args, 0) == PR_GET_DUMPABLE) {
+        args->ret = 0;
+        args->skip_origin = 1;
+    }
+}
+
+static void before_exit_syscall(hook_fargs1_t *args, void *udata)
+{
+    uid_t uid = current_uid();
+    if (uid < AID_APP_START) return;
+
+    long status = (long)syscall_argn(args, 0);
+    struct pt_regs *regs = NULL;
+    long nr = -1;
+
+    if (has_syscall_wrapper)
+        regs = (struct pt_regs *)((hook_fargs0_t *)args)->args[0];
+    if (regs)
+        nr = regs->syscallno;
+
+    if (!regs || !user_mode(regs))
+        return;
+
+    const char *comm = get_task_comm(current);
+    unsigned long pc = (unsigned long)regs->pc;
+    unsigned long lr = (unsigned long)regs->regs[30];
+
+    if (nr == __NR_exit_group && status == 0 &&
+        comm && strstr(comm, "mo.client") &&
+        ((lr & 0xffffUL) == 0xe120UL)) {
+        pr_info("anti-detect: paic bypass exit_group comm=%s pc=%lx lr=%lx\n",
+                comm, pc, lr);
+        args->ret = 0;
+        args->skip_origin = 1;
+    }
 }
 
 static int resolve_symbols(void)
@@ -254,6 +372,12 @@ static const struct syscall_hook hooks[] = {
     { __NR_readlinkat,    4, before_stat_syscall, after_readlinkat_syscall },
     /* getdents64 - filter output */
     { __NR_getdents64,    3, 0, after_getdents64 },
+    /* native anti-debug probes */
+    { __NR_ptrace,        4, before_ptrace_syscall, 0 },
+    { __NR_prctl,         5, before_prctl_syscall, 0 },
+    /* PAIC libxloader self-exit bypass */
+    { __NR_exit,          1, before_exit_syscall, 0 },
+    { __NR_exit_group,    1, before_exit_syscall, 0 },
 };
 
 #define NUM_HOOKS (sizeof(hooks) / sizeof(hooks[0]))

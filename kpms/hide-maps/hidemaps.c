@@ -13,7 +13,7 @@
 #include "../common/kpm_demo_helpers.h"
 
 ///< The name of the module, each KPM must has a unique name.
-KPM_MODULE_INFO("kpm-hide-maps", "1.0.2", "GPL v2", "wwb", "Hide instrumentation helper VMAs from /proc/<pid>/maps");
+KPM_MODULE_INFO("kpm-hide-maps", "1.0.4", "GPL v2", "wwb", "Hide instrumentation helper VMAs from /proc/<pid>/maps");
 
 
 typedef struct seq_file {
@@ -27,26 +27,45 @@ static void *(*vmalloc)(unsigned long size);
 static void (*vfree)(void *point);
 static void *show_map_vma;
 
-static const char *hidden_map_tokens[] = {
+static const char * const hidden_map_tokens[] = {
     "wwb_",
-    "frida",
-    "Frida",
+    "frida-server",
+    "frida-helper",
+    "frida-agent",
+    "frida-gadget",
+    "libfrida",
+    "re.frida.server",
     "rustfrida",
     "rustFrida",
     "rust_frida",
     "rf_test",
-    "gum-js-loop",
-    "gmain",
-    "gdbus",
     "linjector",
     "/data/local/tmp/rf_",
     "/data/local/tmp/frida",
     "/memfd:rust",
-    "/memfd:agent",
     "/memfd:frida",
     "[anon:rust",
     "[anon:frida",
-    "[anon:agent",
+    "xposed",
+    "Xposed",
+    "lsposed",
+    "LSPosed",
+    "lspd",
+    "org.lsposed",
+    "liblspd",
+    "riru",
+    "Riru",
+    "edxp",
+    "EdXposed",
+    "libriru_edxp",
+    "lspatch",
+    "LSPatch",
+    "yukihook",
+    "YukiHook",
+    "com.highcapable.yukihookapi",
+    "anydebug",
+    "AnyDebug",
+    "com.hhvvg.anydebug",
     NULL,
 };
 
@@ -61,85 +80,12 @@ static int line_contains_any(const char *line, const char * const *tokens)
     return 0;
 }
 
-static int hex_digit_value(char c)
-{
-    if (c >= '0' && c <= '9')
-        return c - '0';
-    if (c >= 'a' && c <= 'f')
-        return c - 'a' + 10;
-    if (c >= 'A' && c <= 'F')
-        return c - 'A' + 10;
-    return -1;
-}
-
-static int parse_maps_range(const char *line, unsigned long *start, unsigned long *end)
-{
-    unsigned long value = 0;
-    int digit;
-
-    if (!line || !start || !end)
-        return 0;
-
-    digit = hex_digit_value(*line);
-    if (digit < 0)
-        return 0;
-
-    while ((digit = hex_digit_value(*line)) >= 0) {
-        value = (value << 4) | (unsigned long)digit;
-        line++;
-    }
-    if (*line != '-')
-        return 0;
-    *start = value;
-
-    line++;
-    value = 0;
-    digit = hex_digit_value(*line);
-    if (digit < 0)
-        return 0;
-
-    while ((digit = hex_digit_value(*line)) >= 0) {
-        value = (value << 4) | (unsigned long)digit;
-        line++;
-    }
-    *end = value;
-    return *end > *start;
-}
-
-static int is_stagefright_payload_split(const char *line)
-{
-    unsigned long start;
-    unsigned long end;
-
-    if (!strstr(line, " r-xp "))
-        return 0;
-    if (!strstr(line, "/system/lib64/libstagefright.so") &&
-        !strstr(line, "/system/lib/libstagefright.so"))
-        return 0;
-    if (!parse_maps_range(line, &start, &end))
-        return 0;
-
-    return end - start <= 0x1000UL;
-}
-
 static int should_hide_maps_line(const char *line)
 {
     if (!line)
         return 0;
 
     if (line_contains_any(line, hidden_map_tokens))
-        return 1;
-
-    /* Any RWX private executable VMA is a high-signal instrumentation artifact. */
-    if (strstr(line, " rwxp "))
-        return 1;
-
-    /*
-     * The early zygote payload uses a system library page as temporary backing.
-     * Even after restoring bytes, the child may still expose a single-page
-     * executable split in maps. Hide only that narrow shape, not the full lib.
-     */
-    if (is_stagefright_payload_split(line))
         return 1;
 
     return 0;
