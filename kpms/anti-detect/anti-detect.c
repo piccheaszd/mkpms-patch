@@ -21,10 +21,10 @@
 #include "../common/kpm_demo_helpers.h"
 
 KPM_MODULE_INFO("anti-detect",
-                "1.2.0",
+                "1.2.1",
                 "GPL v2",
                 "wwb",
-                "Hide emulator files and KernelPatch presence from apps");
+                "Hide emulator, KernelPatch, and instrumentation artifacts from apps");
 
 /* anti-detect-supercall.c */
 extern int supercall_guard_init(const char *superkey);
@@ -55,6 +55,25 @@ struct linux_dirent64 {
 
 static const char *hidden_names[] = {
     "goldfish_",
+    "wwb_",
+    "frida",
+    "Frida",
+    "rustfrida",
+    "rustFrida",
+    "rust_frida",
+    "rf_test",
+    "gum-js-loop",
+    "gmain",
+    "gdbus",
+    "linjector",
+    "/data/local/tmp/rf_",
+    "/data/local/tmp/frida",
+    "memfd:rust",
+    "memfd:agent",
+    "memfd:frida",
+    "[anon:rust",
+    "[anon:frida",
+    "[anon:agent",
     NULL,
 };
 
@@ -81,6 +100,33 @@ static void before_stat_syscall(hook_fargs4_t *args, void *udata)
     if (should_hide(buf)) {
         args->ret = -ENOENT;
         args->skip_origin = 1;
+    }
+}
+
+/* Hide symlink targets such as proc-fd entries pointing at helper memfds. */
+static void after_readlinkat_syscall(hook_fargs4_t *args, void *udata)
+{
+    uid_t uid = current_uid();
+    if (uid < AID_APP_START) return;
+
+    long ret = (long)args->ret;
+    if (ret <= 0) return;
+
+    char __user *ubuf = (char __user *)syscall_argn(args, 2);
+    char buf[FILENAME_BUF_SIZE];
+    long n = ret;
+
+    if (!ubuf) return;
+    if (n >= FILENAME_BUF_SIZE)
+        n = FILENAME_BUF_SIZE - 1;
+    if (kfn_copy_from_user(buf, ubuf, n))
+        return;
+    buf[n] = '\0';
+
+    if (should_hide(buf)) {
+        char empty = '\0';
+        compat_copy_to_user(ubuf, &empty, 1);
+        args->ret = -ENOENT;
     }
 }
 
@@ -205,7 +251,7 @@ static const struct syscall_hook hooks[] = {
     { __NR_faccessat2,    4, before_stat_syscall, 0 },
     { __NR3264_fstatat,   4, before_stat_syscall, 0 },
     { __NR_statx,         5, before_stat_syscall, 0 },
-    { __NR_readlinkat,    4, before_stat_syscall, 0 },
+    { __NR_readlinkat,    4, before_stat_syscall, after_readlinkat_syscall },
     /* getdents64 - filter output */
     { __NR_getdents64,    3, 0, after_getdents64 },
 };
