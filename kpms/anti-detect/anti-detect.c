@@ -22,7 +22,7 @@
 #include "../common/kpm_demo_helpers.h"
 
 KPM_MODULE_INFO("anti-detect",
-                "1.2.15",
+                "1.2.21",
                 "GPL v2",
                 "wwb",
                 "Hide emulator, KernelPatch, and instrumentation artifacts from apps");
@@ -32,6 +32,8 @@ extern int supercall_guard_init(const char *superkey);
 extern void supercall_guard_exit(void);
 
 #define AID_APP_START 10000
+#define AID_ISOLATED_START 99000
+#define AID_ISOLATED_END 99999
 #define FILENAME_BUF_SIZE 256
 
 #ifndef __NR_faccessat2
@@ -156,6 +158,7 @@ static const char * const self_protect_loader_tokens[] = {
 };
 
 static uid_t lsposed_manager_uid = (uid_t)-1;
+static uid_t bochk_app_uid = (uid_t)-1;
 
 static int contains_any_token(const char *name, const char * const *tokens)
 {
@@ -193,6 +196,44 @@ static int current_is_lsposed_manager(void)
     return 0;
 }
 
+static void cache_bochk_uid_if_named(uid_t uid)
+{
+    if (uid >= AID_APP_START && task_comm_contains(current, "bochk.app.aos"))
+        bochk_app_uid = uid;
+}
+
+static int current_name_is_bochk_component(void)
+{
+    return task_comm_contains(current, "bochk.app.aos") ||
+           task_comm_contains(current, "fiqlohqeo");
+}
+
+static int uid_is_isolated(uid_t uid)
+{
+    return uid >= AID_ISOLATED_START && uid <= AID_ISOLATED_END;
+}
+
+static int current_is_bochk_process(uid_t uid)
+{
+    cache_bochk_uid_if_named(uid);
+    return uid >= AID_APP_START && uid == bochk_app_uid;
+}
+
+static int should_skip_process(uid_t uid)
+{
+    /*
+     * BOCHK reports integrity code 03 when these syscall results are tampered
+     * with. Keep its main and obfuscated helper processes outside this KPM and
+     * handle only UI-level behavior there.
+     */
+    if (uid_is_isolated(uid))
+        return 1;
+
+    cache_bochk_uid_if_named(uid);
+    return current_name_is_bochk_component() ||
+           (uid >= AID_APP_START && uid == bochk_app_uid);
+}
+
 static int current_may_see_hidden_artifacts(void)
 {
     return current_is_lsposed_manager();
@@ -218,7 +259,7 @@ static int should_hide_link_target(const char *name)
 static void before_stat_syscall(hook_fargs4_t *args, void *udata)
 {
     uid_t uid = current_uid();
-    if (uid < AID_APP_START) return;
+    if (uid < AID_APP_START || should_skip_process(uid)) return;
 
     const char __user *ufilename = (const char __user *)syscall_argn(args, 1);
     char buf[FILENAME_BUF_SIZE];
@@ -235,7 +276,7 @@ static void before_stat_syscall(hook_fargs4_t *args, void *udata)
 static void after_readlinkat_syscall(hook_fargs4_t *args, void *udata)
 {
     uid_t uid = current_uid();
-    if (uid < AID_APP_START) return;
+    if (uid < AID_APP_START || should_skip_process(uid)) return;
 
     long ret = (long)args->ret;
     if (ret <= 0) return;
@@ -282,7 +323,7 @@ static int getdents_has_hidden(char __user *ubuf, long len)
 static void after_getdents64(hook_fargs4_t *args, void *udata)
 {
     uid_t uid = current_uid();
-    if (uid < AID_APP_START) return;
+    if (uid < AID_APP_START || should_skip_process(uid)) return;
 
     long ret = (long)args->ret;
     if (ret <= 0) return;
@@ -380,7 +421,8 @@ static void after_read_syscall(hook_fargs3_t *args, void *udata)
     char __user *ubuf;
     char *kbuf;
 
-    if (uid < AID_APP_START || ret <= 0 || ret > READ_SANITIZE_MAX)
+    if (uid < AID_APP_START || should_skip_process(uid) ||
+        ret <= 0 || ret > READ_SANITIZE_MAX)
         return;
 
     ubuf = (char __user *)syscall_argn(args, 1);
@@ -409,7 +451,7 @@ static void after_read_syscall(hook_fargs3_t *args, void *udata)
 static void before_ptrace_syscall(hook_fargs4_t *args, void *udata)
 {
     uid_t uid = current_uid();
-    if (uid < AID_APP_START) return;
+    if (uid < AID_APP_START || should_skip_process(uid)) return;
 
     if ((long)syscall_argn(args, 0) == PTRACE_TRACEME) {
         args->ret = 0;
@@ -420,7 +462,7 @@ static void before_ptrace_syscall(hook_fargs4_t *args, void *udata)
 static void before_prctl_syscall(hook_fargs5_t *args, void *udata)
 {
     uid_t uid = current_uid();
-    if (uid < AID_APP_START) return;
+    if (uid < AID_APP_START || should_skip_process(uid)) return;
 
     if ((long)syscall_argn(args, 0) == PR_GET_DUMPABLE) {
         args->ret = 0;
@@ -536,6 +578,7 @@ static int is_self_protect_exit_status(long status)
 }
 
 static int classify_self_protect_exit(long nr, long status, const char *comm,
+                                      uid_t uid,
                                       unsigned long pc, unsigned long lr)
 {
     if (nr != __NR_exit && nr != __NR_exit_group)
@@ -545,6 +588,9 @@ static int classify_self_protect_exit(long nr, long status, const char *comm,
         caller_matches_self_protect_loader(pc, lr))
         return 1;
 
+    if (is_self_protect_exit_status(status) && current_is_bochk_process(uid))
+        return 4;
+
     if (status == 0 && comm && strstr(comm, "mo.client") && ((lr & 0xffffUL) == 0xe120UL))
         return 2;
 
@@ -553,10 +599,12 @@ static int classify_self_protect_exit(long nr, long status, const char *comm,
 
 static int is_fatal_signal(long sig)
 {
-    return sig == 6 || sig == 9 || sig == 15;
+    return sig == 4 || sig == 5 || sig == 6 || sig == 7 ||
+           sig == 9 || sig == 11 || sig == 15;
 }
 
-static int classify_self_protect_kill(long sig, unsigned long pc, unsigned long lr)
+static int classify_self_protect_kill(long sig, uid_t uid,
+                                      unsigned long pc, unsigned long lr)
 {
     if (!is_fatal_signal(sig))
         return 0;
@@ -564,13 +612,16 @@ static int classify_self_protect_kill(long sig, unsigned long pc, unsigned long 
     if (caller_matches_self_protect_loader(pc, lr))
         return 3;
 
+    if (current_is_bochk_process(uid))
+        return 4;
+
     return 0;
 }
 
 static void before_exit_syscall(hook_fargs1_t *args, void *udata)
 {
     uid_t uid = current_uid();
-    if (uid < AID_APP_START) return;
+    if (uid < AID_APP_START || should_skip_process(uid)) return;
 
     long status = (long)syscall_argn(args, 0);
     struct pt_regs *regs = NULL;
@@ -587,7 +638,7 @@ static void before_exit_syscall(hook_fargs1_t *args, void *udata)
     const char *comm = get_task_comm(current);
     unsigned long pc = (unsigned long)regs->pc;
     unsigned long lr = (unsigned long)regs->regs[30];
-    int self_protect_reason = classify_self_protect_exit(nr, status, comm, pc, lr);
+    int self_protect_reason = classify_self_protect_exit(nr, status, comm, uid, pc, lr);
 
     if (self_protect_reason) {
         pr_info("anti-detect: bypass self-protect exit nr=%ld status=%ld comm=%s pc=%lx lr=%lx reason=%d\n",
@@ -600,7 +651,7 @@ static void before_exit_syscall(hook_fargs1_t *args, void *udata)
 static void before_kill_syscall(hook_fargs4_t *args, void *udata)
 {
     uid_t uid = current_uid();
-    if (uid < AID_APP_START)
+    if (uid < AID_APP_START || should_skip_process(uid))
         return;
 
     struct pt_regs *regs = NULL;
@@ -625,7 +676,7 @@ static void before_kill_syscall(hook_fargs4_t *args, void *udata)
     const char *comm = get_task_comm(current);
     unsigned long pc = (unsigned long)regs->pc;
     unsigned long lr = (unsigned long)regs->regs[30];
-    int reason = classify_self_protect_kill(sig, pc, lr);
+    int reason = classify_self_protect_kill(sig, uid, pc, lr);
 
     if (reason) {
         pr_info("anti-detect: bypass self-protect kill nr=%ld target=%ld tid=%ld sig=%ld comm=%s pc=%lx lr=%lx reason=%d\n",

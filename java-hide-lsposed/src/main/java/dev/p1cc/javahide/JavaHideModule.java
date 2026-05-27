@@ -14,10 +14,12 @@ import java.util.Map;
 
 public final class JavaHideModule implements IXposedHookLoadPackage {
     private static final String TAG = "JavaHide: ";
+    private static final String PACKAGE_BOCHK = "com.bochk.app.aos";
+    private static final String PACKAGE_OPLUS_SECURITY_PERMISSION = "com.oplus.securitypermission";
 
     private static final String[] TARGET_PACKAGES = {
-            "com.bochk.app.aos",
-            "com.paic.mo.client"
+            PACKAGE_BOCHK,
+            PACKAGE_OPLUS_SECURITY_PERMISSION
     };
 
     private static final String[] HIDDEN_TOKENS = {
@@ -36,7 +38,9 @@ public final class JavaHideModule implements IXposedHookLoadPackage {
             "libxposed_art",
             "edxposed",
             "riru",
-            "zygisk"
+            "zygisk",
+            "javahide",
+            "dev.p1cc.javahide"
     };
 
     private static final ThreadLocal<Boolean> INTERNAL = new ThreadLocal<Boolean>();
@@ -44,6 +48,7 @@ public final class JavaHideModule implements IXposedHookLoadPackage {
     private static volatile ClassLoader cleanAppClassLoader;
     private static volatile String cleanAppSourceDir;
     private static volatile String cleanNativeLibraryDir;
+    private static volatile boolean bochkIntegrityGateHookInstalled;
     private static int hiddenLogCount;
 
     @Override
@@ -52,16 +57,121 @@ public final class JavaHideModule implements IXposedHookLoadPackage {
             return;
         }
 
+        if (PACKAGE_OPLUS_SECURITY_PERMISSION.equals(lpparam.packageName)) {
+            installOplusStartConfirmHook(lpparam.classLoader);
+            XposedBridge.log(TAG + "installed OPlus start-confirm blocker for " + lpparam.processName);
+            return;
+        }
+
+        if (PACKAGE_BOCHK.equals(lpparam.packageName)) {
+            if (PACKAGE_BOCHK.equals(lpparam.processName)) {
+                installBochkReportHook(lpparam.classLoader);
+                XposedBridge.log(TAG + "installed BOCHK report blocker for " + lpparam.processName);
+            } else {
+                XposedBridge.log(TAG + "skip BOCHK helper process " + lpparam.processName);
+            }
+            return;
+        }
+
         active = false;
-        String appSourceDir = null;
-        installStackTraceHooks();
-        installClassLookupHooks(lpparam.classLoader);
-        installClassLoaderSurfaceHooks(appSourceDir);
+        cleanAppClassLoader = null;
+        cleanAppSourceDir = null;
+        cleanNativeLibraryDir = null;
+        bochkIntegrityGateHookInstalled = false;
+        prepareCleanClassLoader(fieldValue(lpparam, "appInfo"), lpparam.classLoader);
+        installClassLoaderSurfaceHooks(cleanAppSourceDir);
         installContextClassLoaderHooks();
         installIntentHooks();
-        installLibXloaderReportHook(lpparam.classLoader);
         installActivationHook();
         XposedBridge.log(TAG + "installed for " + lpparam.packageName + " / " + lpparam.processName);
+    }
+
+    private static void installOplusStartConfirmHook(final ClassLoader classLoader) {
+        runInternal(new ThrowingRunnable() {
+            @Override
+            public void run() throws Throwable {
+                Class<?> activityClass = Class.forName(
+                        "com.oplusos.securitypermission.permission.ui.AppStartConfirmDialogActivity",
+                        false,
+                        classLoader);
+                Class<?> appStartDataClass = Class.forName(
+                        "com.oplusos.securitypermission.permission.ui.AppStartConfirmDialogActivity$a",
+                        false,
+                        classLoader);
+
+                hookMatchingMethods(activityClass, "E", new MethodMatcher() {
+                    @Override
+                    public boolean matches(Method method) {
+                        Class<?>[] parameterTypes = method.getParameterTypes();
+                        return parameterTypes.length == 1 && parameterTypes[0] == appStartDataClass;
+                    }
+                }, new XC_MethodHook() {
+                    @Override
+                    protected void beforeHookedMethod(MethodHookParam param) {
+                        Object appStartData = param.args == null || param.args.length == 0 ? null : param.args[0];
+                        if (!shouldBlockOplusAppStartData(appStartData)) {
+                            return;
+                        }
+                        XposedBridge.log(TAG + "suppress OPlus startActivityAsCaller " + safeLogValue(String.valueOf(appStartData)));
+                        param.setResult(null);
+                    }
+                });
+
+                hookMatchingMethods(activityClass, "D", new MethodMatcher() {
+                    @Override
+                    public boolean matches(Method method) {
+                        Class<?>[] parameterTypes = method.getParameterTypes();
+                        return parameterTypes.length == 2 && parameterTypes[0] == appStartDataClass;
+                    }
+                }, new XC_MethodHook() {
+                    @Override
+                    protected void beforeHookedMethod(MethodHookParam param) {
+                        Object appStartData = param.args == null || param.args.length == 0 ? null : param.args[0];
+                        if (!shouldBlockOplusAppStartData(appStartData)) {
+                            return;
+                        }
+                        XposedBridge.log(TAG + "auto-close OPlus start confirm " + safeLogValue(String.valueOf(appStartData)));
+                        invokeOplusStartConfirmDecision(param.thisObject, appStartData, -1, false);
+                        param.setResult(null);
+                    }
+                });
+            }
+        });
+    }
+
+    private static boolean shouldBlockOplusAppStartData(Object appStartData) {
+        if (appStartData == null) {
+            return false;
+        }
+
+        String caller = invokeString(appStartData, "d");
+        if (!PACKAGE_BOCHK.equals(caller)) {
+            return false;
+        }
+
+        Object sourceIntent = invokeNoArg(appStartData, "e");
+        if (shouldBlockIntentObject(sourceIntent)) {
+            return true;
+        }
+
+        String callee = invokeString(appStartData, "b");
+        String value = String.valueOf(appStartData).toLowerCase();
+        return callee != null
+                && value.indexOf("bochk.com") >= 0
+                && (callee.indexOf("browser") >= 0 || callee.indexOf("firefox") >= 0 || callee.indexOf("chrome") >= 0);
+    }
+
+    private static void invokeOplusStartConfirmDecision(Object activity, Object appStartData, int which, boolean checked) {
+        if (activity == null || appStartData == null) {
+            return;
+        }
+        try {
+            Method decision = activity.getClass().getDeclaredMethod("B", Integer.TYPE, Boolean.TYPE, appStartData.getClass());
+            decision.setAccessible(true);
+            decision.invoke(activity, Integer.valueOf(which), Boolean.valueOf(checked), appStartData);
+        } catch (Throwable throwable) {
+            XposedBridge.log(TAG + "failed to auto-close OPlus start confirm: " + throwable);
+        }
     }
 
     private static void installActivationHook() {
@@ -76,9 +186,6 @@ public final class JavaHideModule implements IXposedHookLoadPackage {
                     @Override
                     protected void beforeHookedMethod(MethodHookParam param) {
                         active = true;
-                        if (param.args != null && param.args.length > 0) {
-                            installCleanClassLoader(param.args[0]);
-                        }
                         XposedBridge.log(TAG + "activated before Application.attach");
                     }
 
@@ -149,6 +256,78 @@ public final class JavaHideModule implements IXposedHookLoadPackage {
                 });
             }
         });
+    }
+
+    private static void prepareCleanClassLoader(final Object appInfo, final ClassLoader fallbackClassLoader) {
+        if (cleanAppClassLoader != null) {
+            return;
+        }
+        runInternal(new ThrowingRunnable() {
+            @Override
+            public void run() throws Throwable {
+                String sourceDir = stringField(appInfo, "sourceDir");
+                String nativeLibraryDir = stringField(appInfo, "nativeLibraryDir");
+                String dexPath = sourceDir;
+                if (dexPath == null || dexPath.length() == 0) {
+                    dexPath = extractApkDexPath(fallbackClassLoader);
+                    sourceDir = firstPathEntry(dexPath);
+                }
+                if (dexPath == null || dexPath.length() == 0 || sourceDir == null || sourceDir.length() == 0) {
+                    return;
+                }
+
+                Class<?> pathClassLoaderClass = Class.forName("dalvik.system.PathClassLoader");
+                Object clean = pathClassLoaderClass
+                        .getConstructor(String.class, String.class, ClassLoader.class)
+                        .newInstance(dexPath, nativeLibraryDir, ClassLoader.getSystemClassLoader().getParent());
+                if (!(clean instanceof ClassLoader)) {
+                    return;
+                }
+
+                cleanAppSourceDir = sourceDir;
+                cleanNativeLibraryDir = nativeLibraryDir;
+                cleanAppClassLoader = (ClassLoader) clean;
+                Thread.currentThread().setContextClassLoader(cleanAppClassLoader);
+                XposedBridge.log(TAG + "clean classloader prepared source=" + sourceDir);
+            }
+        });
+    }
+
+    private static String extractApkDexPath(Object classLoader) {
+        String value = String.valueOf(classLoader);
+        StringBuilder dexPath = new StringBuilder();
+        int search = 0;
+        while (value != null) {
+            int start = value.indexOf("/data/app/", search);
+            if (start < 0) {
+                start = value.indexOf("/mnt/expand/", search);
+            }
+            if (start < 0) {
+                break;
+            }
+            int end = value.indexOf(".apk", start);
+            if (end < 0) {
+                break;
+            }
+            end += 4;
+            String path = value.substring(start, end);
+            if (dexPath.indexOf(path) < 0) {
+                if (dexPath.length() > 0) {
+                    dexPath.append(File.pathSeparator);
+                }
+                dexPath.append(path);
+            }
+            search = end;
+        }
+        return dexPath.length() == 0 ? null : dexPath.toString();
+    }
+
+    private static String firstPathEntry(String path) {
+        if (path == null || path.length() == 0) {
+            return null;
+        }
+        int separator = path.indexOf(File.pathSeparator);
+        return separator < 0 ? path : path.substring(0, separator);
     }
 
     private static void installCleanClassLoader(Object context) {
@@ -238,6 +417,11 @@ public final class JavaHideModule implements IXposedHookLoadPackage {
                     param.setThrowable(new ClassNotFoundException(name));
                 }
             }
+
+            @Override
+            protected void afterHookedMethod(MethodHookParam param) {
+                maybeInstallBochkIntegrityGateHook(param.getResult());
+            }
         });
     }
 
@@ -280,6 +464,17 @@ public final class JavaHideModule implements IXposedHookLoadPackage {
                         }
                     }
                 });
+                hookMethods(dexFile, "toString", new XC_MethodHook() {
+                    @Override
+                    protected void afterHookedMethod(MethodHookParam param) {
+                        Object result = param.getResult();
+                        if (active && result instanceof String && containsHiddenToken((String) result)) {
+                            logHidden("DexFile.toString", (String) result);
+                            param.setResult("DexFile[" + replacementPath(appSourceDir) + "]");
+                        }
+                    }
+                });
+                hookDexFileClassLoaderContextMethods(dexFile, appSourceDir);
             }
         });
 
@@ -298,6 +493,65 @@ public final class JavaHideModule implements IXposedHookLoadPackage {
                 if (sanitized != result) {
                     logHidden("Field.get", field.toString());
                     param.setResult(sanitized);
+                }
+            }
+        });
+    }
+
+    private static void hookDexFileClassLoaderContextMethods(final Class<?> dexFile, final String appSourceDir) {
+        hookMatchingMethods(dexFile, "getClassLoaderContext", new MethodMatcher() {
+            @Override
+            public boolean matches(Method method) {
+                return method.getReturnType() == String.class;
+            }
+        }, new XC_MethodHook() {
+            @Override
+            protected void afterHookedMethod(MethodHookParam param) {
+                Object result = param.getResult();
+                if (!active || !(result instanceof String)) {
+                    return;
+                }
+                String context = (String) result;
+                if (containsHiddenToken(context) || context.toLowerCase().indexOf("unsupported") >= 0) {
+                    logHidden("DexFile.getClassLoaderContext", context);
+                    param.setResult(sanitizedClassLoaderContext(appSourceDir));
+                }
+            }
+        });
+
+        hookMatchingMethods(dexFile, "isValidClassLoaderContext", new MethodMatcher() {
+            @Override
+            public boolean matches(Method method) {
+                return method.getReturnType() == Boolean.TYPE;
+            }
+        }, new XC_MethodHook() {
+            @Override
+            protected void beforeHookedMethod(MethodHookParam param) {
+                if (!active || !argsContainClassLoaderArtifact(param)) {
+                    return;
+                }
+                logHidden("DexFile.isValidClassLoaderContext", argsToString(param));
+                param.setResult(Boolean.TRUE);
+            }
+        });
+
+        hookDexFileStringOutputMethod(dexFile, "getDexFileOutputPath", appSourceDir);
+        hookDexFileStringOutputMethod(dexFile, "getDexFileStatus", appSourceDir);
+    }
+
+    private static void hookDexFileStringOutputMethod(final Class<?> dexFile, final String methodName, final String appSourceDir) {
+        hookMatchingMethods(dexFile, methodName, new MethodMatcher() {
+            @Override
+            public boolean matches(Method method) {
+                return method.getReturnType() == String.class;
+            }
+        }, new XC_MethodHook() {
+            @Override
+            protected void afterHookedMethod(MethodHookParam param) {
+                Object result = param.getResult();
+                if (active && result instanceof String && containsHiddenToken((String) result)) {
+                    logHidden("DexFile." + methodName, (String) result);
+                    param.setResult(replacementPath(appSourceDir));
                 }
             }
         });
@@ -324,6 +578,11 @@ public final class JavaHideModule implements IXposedHookLoadPackage {
                 }
                 resolveClassForNameWithAppLoader(param, name, appClassLoader);
             }
+
+            @Override
+            protected void afterHookedMethod(MethodHookParam param) {
+                maybeInstallBochkIntegrityGateHook(param.getResult());
+            }
         });
     }
 
@@ -345,6 +604,11 @@ public final class JavaHideModule implements IXposedHookLoadPackage {
                     logHidden("Class.forName(loader)", name);
                     param.setThrowable(new ClassNotFoundException(name));
                 }
+            }
+
+            @Override
+            protected void afterHookedMethod(MethodHookParam param) {
+                maybeInstallBochkIntegrityGateHook(param.getResult());
             }
         });
     }
@@ -391,7 +655,7 @@ public final class JavaHideModule implements IXposedHookLoadPackage {
         });
     }
 
-    private static void installLibXloaderReportHook(final ClassLoader appClassLoader) {
+    private static void installBochkReportHook(final ClassLoader appClassLoader) {
         runInternal(new ThrowingRunnable() {
             @Override
             public void run() throws Throwable {
@@ -404,8 +668,19 @@ public final class JavaHideModule implements IXposedHookLoadPackage {
                     protected void afterHookedMethod(MethodHookParam param) {
                         Object result = param.getResult();
                         if (result instanceof String && shouldSuppressReport((String) result)) {
-                            XposedBridge.log(TAG + "native report read " + safeLogValue((String) result));
+                            XposedBridge.log(TAG + "suppress native report read " + safeLogValue((String) result));
+                            param.setResult("");
                         }
+                    }
+                });
+
+                Method startReportThread = reportClass.getDeclaredMethod("c");
+                startReportThread.setAccessible(true);
+                XposedBridge.hookMethod(startReportThread, new XC_MethodHook() {
+                    @Override
+                    protected void beforeHookedMethod(MethodHookParam param) {
+                        XposedBridge.log(TAG + "suppress native report thread");
+                        param.setResult(null);
                     }
                 });
 
@@ -415,12 +690,60 @@ public final class JavaHideModule implements IXposedHookLoadPackage {
                     @Override
                     protected void beforeHookedMethod(MethodHookParam param) {
                         String report = stringArg(param, 0);
-                        if (shouldSuppressReport(report)) {
-                            XposedBridge.log(TAG + "suppress native report " + safeLogValue(report));
-                            param.setResult(null);
-                        }
+                        XposedBridge.log(TAG + "suppress native report dispatch " + safeLogValue(report));
+                        param.setResult(null);
                     }
                 });
+            }
+        });
+    }
+
+    private static void installBochkIntegrityGateHook(final ClassLoader appClassLoader) {
+        if (bochkIntegrityGateHookInstalled || appClassLoader == null) {
+            return;
+        }
+        runInternal(new ThrowingRunnable() {
+            @Override
+            public void run() throws Throwable {
+                Class<?> loaderClass = Class.forName("fiqlohqeo.ap", false, appClassLoader);
+                installBochkIntegrityGateHook(loaderClass);
+            }
+        });
+    }
+
+    private static void maybeInstallBochkIntegrityGateHook(Object value) {
+        if (bochkIntegrityGateHookInstalled || !(value instanceof Class)) {
+            return;
+        }
+        Class<?> type = (Class<?>) value;
+        if ("fiqlohqeo.ap".equals(type.getName())) {
+            installBochkIntegrityGateHook(type);
+        }
+    }
+
+    private static void installBochkIntegrityGateHook(final Class<?> loaderClass) {
+        if (loaderClass == null || !"fiqlohqeo.ap".equals(loaderClass.getName())) {
+            return;
+        }
+        runInternal(new ThrowingRunnable() {
+            @Override
+            public void run() throws Throwable {
+                synchronized (JavaHideModule.class) {
+                    if (bochkIntegrityGateHookInstalled) {
+                        return;
+                    }
+                    Method integrityGate = loaderClass.getDeclaredMethod("d");
+                    integrityGate.setAccessible(true);
+                    XposedBridge.hookMethod(integrityGate, new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            XposedBridge.log(TAG + "force BOCHK integrity gate false");
+                            param.setResult(Boolean.FALSE);
+                        }
+                    });
+                    bochkIntegrityGateHookInstalled = true;
+                    XposedBridge.log(TAG + "BOCHK integrity gate hook installed");
+                }
             }
         });
     }
@@ -719,10 +1042,13 @@ public final class JavaHideModule implements IXposedHookLoadPackage {
             return false;
         }
         String className = classLoader.getClass().getName();
-        if (!"java.lang.BootClassLoader".equals(className)) {
+        if (containsHiddenToken(className)) {
             return true;
         }
-        return containsHiddenToken(className);
+        if ("java.lang.BootClassLoader".equals(className)) {
+            return false;
+        }
+        return dalvikObjectContainsHiddenToken(classLoader);
     }
 
     private static boolean isTargetAppClassName(String className) {
@@ -802,6 +1128,41 @@ public final class JavaHideModule implements IXposedHookLoadPackage {
         return appSourceDir == null ? "/system/framework/framework.jar" : appSourceDir;
     }
 
+    private static String sanitizedClassLoaderContext(String appSourceDir) {
+        return "PCL[" + replacementPath(appSourceDir) + "]";
+    }
+
+    private static boolean argsContainClassLoaderArtifact(XC_MethodHook.MethodHookParam param) {
+        if (param == null || param.args == null) {
+            return false;
+        }
+        for (int i = 0; i < param.args.length; i++) {
+            Object arg = param.args[i];
+            if (!(arg instanceof String)) {
+                continue;
+            }
+            String value = (String) arg;
+            if (containsHiddenToken(value) || value.toLowerCase().indexOf("unsupported") >= 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static String argsToString(XC_MethodHook.MethodHookParam param) {
+        if (param == null || param.args == null || param.args.length == 0) {
+            return "";
+        }
+        StringBuilder builder = new StringBuilder();
+        for (int i = 0; i < param.args.length; i++) {
+            if (i > 0) {
+                builder.append(", ");
+            }
+            builder.append(String.valueOf(param.args[i]));
+        }
+        return safeLogValue(builder.toString());
+    }
+
     private static boolean containsHiddenToken(String value) {
         if (value == null) {
             return false;
@@ -820,7 +1181,9 @@ public final class JavaHideModule implements IXposedHookLoadPackage {
     }
 
     private static boolean shouldSuppressReport(String value) {
-        return startsWithReportCode(value, "16") || startsWithReportCode(value, "03");
+        return startsWithReportCode(value, "16")
+                || startsWithReportCode(value, "03")
+                || startsWithReportCode(value, "00");
     }
 
     private static String safeLogValue(String value) {

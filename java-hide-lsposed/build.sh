@@ -13,14 +13,15 @@ KEYSTORE="$BUILD/debug.keystore"
 FRAMEWORK_RES="${FRAMEWORK_RES:-/usr/share/android-framework-res/framework-res.apk}"
 R8_VERSION="${R8_VERSION:-9.1.31}"
 R8_JAR="${R8_JAR:-$BUILD/r8-$R8_VERSION.jar}"
+JAVA_RELEASE="${JAVA_RELEASE:-17}"
 
 rm -rf "$CLASSES" "$STUB_CLASSES"
 mkdir -p "$CLASSES" "$STUB_CLASSES"
 
-javac --release 8 -d "$STUB_CLASSES" $(find "$ROOT/stubs" -name '*.java' | sort)
+javac --release "$JAVA_RELEASE" -d "$STUB_CLASSES" $(find "$ROOT/stubs" -name '*.java' | sort)
 jar cf "$STUB_JAR" -C "$STUB_CLASSES" .
 
-javac --release 8 -cp "$STUB_JAR" -d "$CLASSES" $(find "$ROOT/src/main/java" -name '*.java' | sort)
+javac --release "$JAVA_RELEASE" -cp "$STUB_JAR" -d "$CLASSES" $(find "$ROOT/src/main/java" -name '*.java' | sort)
 jar cf "$BUILD/program.jar" -C "$CLASSES" .
 if [[ ! -f "$R8_JAR" ]]; then
     curl -fL --retry 3 \
