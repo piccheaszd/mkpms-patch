@@ -17,7 +17,7 @@
 #endif
 
 KPM_NAME("wxshadow");
-KPM_VERSION("1.1.2");
+KPM_VERSION("1.1.3");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("wxshadow");
 KPM_DESCRIPTION("W^X Shadow Memory - Hidden Breakpoint Mechanism");
@@ -101,9 +101,11 @@ long (*kfunc_copy_from_kernel_nofault)(void *dst, const void *src, size_t size);
 
 /* do_page_fault hook */
 void *kfunc_do_page_fault = NULL;
+void *kfunc_handle_mm_fault = NULL;
 
-/* follow_page_pte hook (GUP hiding for /proc/pid/mem etc.) */
+/* GUP hiding hooks (/proc/pid/mem, process_vm_readv, ptrace) */
 void *kfunc_follow_page_pte = NULL;
+void *kfunc_follow_page_mask = NULL;
 
 /* fork protection hooks */
 void *kfunc_dup_mmap = NULL;
@@ -149,6 +151,14 @@ atomic_t wx_in_flight = ATOMIC_INIT(0);
 
 /* Current hook method */
 enum wx_hook_method hook_method = WX_HOOK_METHOD_NONE;
+
+enum wx_gup_hook_method {
+    WX_GUP_HOOK_NONE = 0,
+    WX_GUP_HOOK_FOLLOW_PAGE_PTE,
+    WX_GUP_HOOK_FOLLOW_PAGE_MASK,
+};
+
+static enum wx_gup_hook_method gup_hook_method = WX_GUP_HOOK_NONE;
 
 /* Forward declaration for hook callbacks */
 static int wxshadow_brk_hook_fn(struct pt_regs *regs, unsigned int esr);
@@ -1486,11 +1496,26 @@ static long wxshadow_init(const char *args, const char *event, void *__user rese
         }
     }
 
+    /* Hook handle_mm_fault for IOPF/SVA/device fault hiding. */
+    if (kfunc_handle_mm_fault) {
+        ret = hook_wrap4(kfunc_handle_mm_fault, handle_mm_fault_before, NULL,
+                         NULL);
+        if (ret != HOOK_NO_ERR) {
+            pr_warn("wxshadow: failed to hook handle_mm_fault: %d\n", ret);
+            pr_warn("wxshadow: IOPF/SVA hiding will be disabled\n");
+            kfunc_handle_mm_fault = NULL;
+        } else {
+            wx_info("wxshadow: hooked handle_mm_fault for IOPF/SVA hiding\n");
+        }
+    }
+
     /* Hook exit_mmap - required for safe teardown on process exit */
     ret = hook_wrap1(kfunc_exit_mmap, exit_mmap_before, NULL, NULL);
     if (ret != HOOK_NO_ERR) {
         pr_err("wxshadow: failed to hook exit_mmap: %d\n", ret);
         pr_err("wxshadow: refusing to load without exit_mmap cleanup\n");
+        if (kfunc_handle_mm_fault)
+            hook_unwrap(kfunc_handle_mm_fault, handle_mm_fault_before, NULL);
         if (kfunc_do_page_fault)
             hook_unwrap(kfunc_do_page_fault, do_page_fault_before, NULL);
         unhook_syscalln(__NR_prctl, prctl_before, NULL);
@@ -1506,16 +1531,43 @@ static long wxshadow_init(const char *args, const char *event, void *__user rese
         wx_info("wxshadow: hooked exit_mmap for proper cleanup\n");
     }
 
-    /* Hook follow_page_pte for GUP hiding (/proc/pid/mem, process_vm_readv, ptrace) */
+    /* Hook a required GUP path for hiding /proc/pid/mem, process_vm_readv, ptrace. */
     if (kfunc_follow_page_pte) {
         ret = hook_wrap5(kfunc_follow_page_pte,
                          follow_page_pte_before, follow_page_pte_after, NULL);
         if (ret != HOOK_NO_ERR) {
             pr_warn("wxshadow: failed to hook follow_page_pte: %d\n", ret);
-            kfunc_follow_page_pte = NULL;
         } else {
+            gup_hook_method = WX_GUP_HOOK_FOLLOW_PAGE_PTE;
             wx_info("wxshadow: hooked follow_page_pte for GUP hiding\n");
         }
+    }
+    if (gup_hook_method == WX_GUP_HOOK_NONE && kfunc_follow_page_mask) {
+        ret = hook_wrap4(kfunc_follow_page_mask,
+                         follow_page_mask_before, follow_page_mask_after, NULL);
+        if (ret != HOOK_NO_ERR) {
+            pr_warn("wxshadow: failed to hook follow_page_mask: %d\n", ret);
+        } else {
+            gup_hook_method = WX_GUP_HOOK_FOLLOW_PAGE_MASK;
+            wx_info("wxshadow: hooked follow_page_mask for GUP hiding\n");
+        }
+    }
+    if (gup_hook_method == WX_GUP_HOOK_NONE) {
+        pr_err("wxshadow: failed to hook GUP path: %d, refusing to load\n", ret);
+        hook_unwrap(kfunc_exit_mmap, exit_mmap_before, NULL);
+        if (kfunc_handle_mm_fault)
+            hook_unwrap(kfunc_handle_mm_fault, handle_mm_fault_before, NULL);
+        if (kfunc_do_page_fault)
+            hook_unwrap(kfunc_do_page_fault, do_page_fault_before, NULL);
+        unhook_syscalln(__NR_prctl, prctl_before, NULL);
+        if (hook_method == WX_HOOK_METHOD_DIRECT) {
+            hook_unwrap(kfunc_single_step_handler, single_step_handler_before, NULL);
+            hook_unwrap(kfunc_brk_handler, brk_handler_before, NULL);
+        } else if (hook_method == WX_HOOK_METHOD_REGISTER) {
+            wx_unregister_brk_step_hooks();
+        }
+        hook_method = WX_HOOK_METHOD_NONE;
+        return -1;
     }
 
     /* Hook fork protection only on precise mm-duplication callbacks. */
@@ -1558,10 +1610,15 @@ static long wxshadow_init(const char *args, const char *event, void *__user rese
     } else {
         wx_info("wxshadow: read hiding DISABLED\n");
     }
-    if (kfunc_follow_page_pte) {
-        wx_info("wxshadow: GUP hiding ENABLED (follow_page_pte hooked)\n");
+    if (kfunc_handle_mm_fault) {
+        wx_info("wxshadow: IOPF/SVA hiding ENABLED (handle_mm_fault hooked)\n");
     } else {
-        wx_info("wxshadow: GUP hiding DISABLED\n");
+        wx_info("wxshadow: IOPF/SVA hiding DISABLED\n");
+    }
+    if (gup_hook_method == WX_GUP_HOOK_FOLLOW_PAGE_PTE) {
+        wx_info("wxshadow: GUP hiding ENABLED (follow_page_pte hooked)\n");
+    } else if (gup_hook_method == WX_GUP_HOOK_FOLLOW_PAGE_MASK) {
+        wx_info("wxshadow: GUP hiding ENABLED (follow_page_mask hooked)\n");
     }
 
     /* Debug: print first 10 processes */
@@ -1693,17 +1750,28 @@ static long wxshadow_exit(void *__user reserved)
         wx_info("wxshadow: unhooked do_page_fault (phase 4)\n");
         wait_for_handlers_drain("phase4-fault");
     }
+    if (kfunc_handle_mm_fault) {
+        hook_unwrap(kfunc_handle_mm_fault, handle_mm_fault_before, NULL);
+        wx_info("wxshadow: unhooked handle_mm_fault (phase 4 - IOPF)\n");
+        wait_for_handlers_drain("phase4-handle_mm_fault");
+    }
 
     /*
-     * Phase 4.5: Unhook access_remote_vm.
+     * Phase 4.5: Unhook GUP hiding.
      * page_list is empty; handler will find no overlapping pages.
      */
-    if (kfunc_follow_page_pte) {
+    if (gup_hook_method == WX_GUP_HOOK_FOLLOW_PAGE_PTE) {
         hook_unwrap(kfunc_follow_page_pte, follow_page_pte_before,
                     follow_page_pte_after);
         wx_info("wxshadow: unhooked follow_page_pte (phase 4.5)\n");
         wait_for_handlers_drain("phase4.5-follow_page_pte");
+    } else if (gup_hook_method == WX_GUP_HOOK_FOLLOW_PAGE_MASK) {
+        hook_unwrap(kfunc_follow_page_mask, follow_page_mask_before,
+                    follow_page_mask_after);
+        wx_info("wxshadow: unhooked follow_page_mask (phase 4.5)\n");
+        wait_for_handlers_drain("phase4.5-follow_page_mask");
     }
+    gup_hook_method = WX_GUP_HOOK_NONE;
 
     /*
      * Phase 5: Unhook exit_mmap last.

@@ -1,5 +1,17 @@
 # WXSHADOW Changelog
 
+## [1.1.3] - 2026-06-18
+
+### Added
+
+- Added `follow_page_mask` as a required GUP hiding fallback when `follow_page_pte` is unavailable. Module load now refuses to continue if neither GUP symbol can be hooked, avoiding a partially hidden state where `/proc/pid/mem`, `process_vm_readv`, or `ptrace` can observe shadow PFNs.
+- Added optional `handle_mm_fault` hook coverage for IOPF/SVA/device fault read paths. Read faults switch to the original mapping, write faults trigger logical release, and instruction faults resume the shadow mapping when needed.
+- Added runtime detection for both 3-argument and 4-argument `kallsyms_on_each_symbol` callback styles, with `kallsyms_lookup_name` fallback when callback iteration is unavailable.
+
+### Changed
+
+- GUP hook teardown now records whether `follow_page_pte` or `follow_page_mask` was actually installed and only unwraps that active path.
+
 ## [1.1.2] - 2026-05-18
 
 ### Fixed

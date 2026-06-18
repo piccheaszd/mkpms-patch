@@ -19,9 +19,21 @@ struct lookup_data {
     unsigned long addr;
 };
 
-static int lookup_callback(void *data, const char *name, struct module *mod, unsigned long addr)
+typedef int (*kallsyms_cb3_t)(void *data, const char *name,
+                              unsigned long addr);
+typedef int (*kallsyms_cb4_t)(void *data, const char *name,
+                              struct module *mod, unsigned long addr);
+typedef int (*kallsyms_each3_t)(kallsyms_cb3_t fn, void *data);
+typedef int (*kallsyms_each4_t)(kallsyms_cb4_t fn, void *data);
+
+static int cb_param_style;
+
+static int lookup_cb_4arg(void *data, const char *name, struct module *mod,
+                          unsigned long addr)
 {
     struct lookup_data *ld = data;
+
+    (void)mod;
     if (strcmp(name, ld->name) == 0) {
         ld->addr = addr;
         return 1; /* stop iteration */
@@ -29,19 +41,84 @@ static int lookup_callback(void *data, const char *name, struct module *mod, uns
     return 0;
 }
 
-/*
- * Safe symbol lookup - only searches vmlinux symbols, never modules.
- * This avoids potential hangs when module_kallsyms_lookup_name
- * traverses the kernel module list.
- */
-static unsigned long lookup_name_safe(const char *name)
+static int lookup_cb_3arg(void *data, const char *name, unsigned long addr)
+{
+    struct lookup_data *ld = data;
+
+    if (strcmp(name, ld->name) == 0) {
+        ld->addr = addr;
+        return 1;
+    }
+    return 0;
+}
+
+static unsigned long lookup_name_with_style(const char *name, int style)
 {
     struct lookup_data ld = { .name = name, .addr = 0 };
 
-    if (kallsyms_on_each_symbol) {
-        kallsyms_on_each_symbol(lookup_callback, &ld);
-    }
+    if (!kallsyms_on_each_symbol)
+        return 0;
+
+    if (style == 3)
+        ((kallsyms_each3_t)kallsyms_on_each_symbol)(lookup_cb_3arg, &ld);
+    else
+        ((kallsyms_each4_t)kallsyms_on_each_symbol)(lookup_cb_4arg, &ld);
+
     return ld.addr;
+}
+
+static bool lookup_addr_plausible(unsigned long addr)
+{
+    return addr && is_kva(addr);
+}
+
+static void detect_kallsyms_callback_style(void)
+{
+    unsigned long addr;
+
+    if (cb_param_style || !kallsyms_on_each_symbol)
+        return;
+
+    addr = lookup_name_with_style("_stext", 4);
+    if (!lookup_addr_plausible(addr))
+        addr = lookup_name_with_style("init_task", 4);
+    if (lookup_addr_plausible(addr)) {
+        cb_param_style = 4;
+        wx_info("wxshadow: kallsyms_on_each_symbol uses 4-param callback\n");
+        return;
+    }
+
+    addr = lookup_name_with_style("_stext", 3);
+    if (!lookup_addr_plausible(addr))
+        addr = lookup_name_with_style("init_task", 3);
+    if (lookup_addr_plausible(addr)) {
+        cb_param_style = 3;
+        wx_info("wxshadow: kallsyms_on_each_symbol uses 3-param callback\n");
+        return;
+    }
+
+    pr_warn("wxshadow: could not detect kallsyms_on_each_symbol callback style\n");
+}
+
+/*
+ * Safe symbol lookup - only searches vmlinux symbols, never modules.
+ * Falls back to kallsyms_lookup_name only when callback-style iteration is
+ * unavailable; do not call it for ordinary misses because some kernels can
+ * hang while traversing module kallsyms.
+ */
+static unsigned long lookup_name_safe(const char *name)
+{
+    unsigned long addr = 0;
+
+    detect_kallsyms_callback_style();
+
+    if (cb_param_style)
+        return lookup_name_with_style(name, cb_param_style);
+
+    if (kallsyms_lookup_name)
+        addr = kallsyms_lookup_name(name);
+
+    return addr;
 }
 
 /* ========== Symbol resolution macros ========== */
@@ -406,13 +483,28 @@ int resolve_symbols(void)
         wx_info("wxshadow: page fault handler found at %px\n", kfunc_do_page_fault);
     }
 
-    /* follow_page_pte for GUP hiding (/proc/pid/mem, process_vm_readv, ptrace) */
-    wx_info("wxshadow: [14/14] follow_page_pte (GUP hiding)...\n");
+    kfunc_handle_mm_fault = (void *)lookup_name_safe("handle_mm_fault");
+    if (kfunc_handle_mm_fault) {
+        wx_info("wxshadow: handle_mm_fault found at %px (IOPF/SVA hiding available)\n",
+                kfunc_handle_mm_fault);
+    } else {
+        pr_warn("wxshadow: handle_mm_fault not found, IOPF/SVA hiding disabled\n");
+    }
+
+    /* GUP hiding (/proc/pid/mem, process_vm_readv, ptrace) */
+    wx_info("wxshadow: [14/14] GUP hiding symbol (required)...\n");
     kfunc_follow_page_pte = (void *)lookup_name_safe("follow_page_pte");
     if (kfunc_follow_page_pte) {
         wx_info("wxshadow: follow_page_pte found at %px\n", kfunc_follow_page_pte);
-    } else {
-        pr_warn("wxshadow: follow_page_pte not found, GUP hiding disabled\n");
+    }
+    kfunc_follow_page_mask = (void *)lookup_name_safe("follow_page_mask");
+    if (kfunc_follow_page_mask) {
+        wx_info("wxshadow: follow_page_mask found at %px (fallback)\n",
+                kfunc_follow_page_mask);
+    }
+    if (!kfunc_follow_page_pte && !kfunc_follow_page_mask) {
+        pr_err("wxshadow: neither follow_page_pte nor follow_page_mask found - REQUIRED for GUP hiding\n");
+        return -ESRCH;
     }
 
     /* dup_mmap for precise fork protection (real mm duplication only) */

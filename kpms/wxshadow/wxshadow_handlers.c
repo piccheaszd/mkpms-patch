@@ -182,14 +182,58 @@ void do_page_fault_before(hook_fargs3_t *args, void *udata)
     WX_HANDLER_EXIT();
 }
 
-/* ========== follow_page_pte hook (GUP hiding) ========== */
+/* ========== handle_mm_fault hook (IOPF/SVA hiding) ========== */
+
+#define FAULT_FLAG_WRITE        0x01
+#define FAULT_FLAG_INSTRUCTION  0x100
+
+static void handle_mm_fault_before_impl(hook_fargs4_t *args, void *udata)
+{
+    void *vma = (void *)args->arg0;
+    unsigned long address = (unsigned long)args->arg1;
+    unsigned int flags = (unsigned int)(unsigned long)args->arg2;
+    void *mm;
+
+    (void)udata;
+
+    if (list_empty(&page_list) || !vma || !is_kva((unsigned long)vma))
+        return;
+
+    mm = vma_mm(vma);
+    if (!mm)
+        return;
+
+    if (flags & FAULT_FLAG_WRITE) {
+        wxshadow_handle_write_fault(mm, address);
+        return;
+    }
+
+    if (flags & FAULT_FLAG_INSTRUCTION) {
+        wxshadow_handle_exec_fault(mm, address);
+        return;
+    }
+
+    if (wxshadow_handle_read_fault(mm, address) == 0) {
+        wx_info("wxshadow: IOPF at %lx, switched to original for device read\n",
+                address);
+    }
+}
+
+void handle_mm_fault_before(hook_fargs4_t *args, void *udata)
+{
+    WX_HANDLER_ENTER();
+    handle_mm_fault_before_impl(args, udata);
+    WX_HANDLER_EXIT();
+}
+
+/* ========== GUP hiding hooks ========== */
 
 /*
- * Hook follow_page_pte to hide shadow pages from cross-process reads.
+ * Hook GUP paths to hide shadow pages from cross-process reads.
  *
  * /proc/pid/mem, process_vm_readv, ptrace all use GUP which calls
- * follow_page_pte to resolve a user PTE to a struct page.  This bypasses
- * user-space page faults entirely.
+ * follow_page_pte or follow_page_mask to resolve a user PTE to a struct page.
+ * This bypasses user-space page faults entirely.
  *
  * Strategy: In the before hook, temporarily swap the PTE from shadow to the
  * live original page so follow_page_pte reads the current original PFN.
@@ -197,27 +241,30 @@ void do_page_fault_before(hook_fargs3_t *args, void *udata)
  * swap it back.  We do NOT flush TLB, so the target process's execution
  * (which uses cached TLB entries pointing to shadow) is unaffected.
  *
- * follow_page_pte(vma, address, pmd, flags, pgmap)
- *   arg0 = vma, arg1 = address, arg2 = pmd, arg3 = flags, arg4 = pgmap
+ * follow_page_pte(vma, address, pmd, flags, pgmap):
+ *   arg0 = vma, arg1 = address, arg2 = pmd, arg3 = flags, arg4 = pgmap.
  *
- * We use arg5 (unused, hook_fargs5_t is hook_fargs8_t) to pass state
- * from before to after: arg5 = wxshadow_page ptr (with refcount held),
- * arg6 = original PTE value to restore.
+ * follow_page_mask(vma, address, flags, page_mask):
+ *   arg0 = vma, arg1 = address, arg2 = flags, arg3 = page_mask.
+ *
+ * State is passed from before to after through hook local storage:
+ * data0 = wxshadow_page ptr (with refcount held), data1 = original PTE,
+ * data2 = PTE pointer.
  */
 
 #define FOLL_WRITE 0x01
 
-static void follow_page_pte_before_impl(hook_fargs5_t *args, void *udata)
+static void gup_hide_before(hook_local_t *local, void *vma,
+                            unsigned long address, unsigned int flags)
 {
-    void *vma = (void *)args->arg0;
-    unsigned long address = (unsigned long)args->arg1;
-    unsigned int flags = (unsigned int)(unsigned long)args->arg3;
     void *mm;
     struct wxshadow_page *page;
     u64 *ptep;
     u64 orig_pte;
 
-    args->arg5 = 0;  /* default: no restore needed */
+    local->data0 = 0;
+    local->data1 = 0;
+    local->data2 = 0;
 
     /* Fast path: no shadow pages at all */
     if (list_empty(&page_list))
@@ -225,6 +272,9 @@ static void follow_page_pte_before_impl(hook_fargs5_t *args, void *udata)
 
     /* Only intercept reads */
     if (flags & FOLL_WRITE)
+        return;
+
+    if (!vma || !is_kva((unsigned long)vma))
         return;
 
     mm = vma_mm(vma);
@@ -250,28 +300,43 @@ static void follow_page_pte_before_impl(hook_fargs5_t *args, void *udata)
         return;
     }
 
-    /* Pass state to after hook (page ref still held) */
-    args->arg5 = (unsigned long)page;
-    args->arg6 = orig_pte;
-    args->arg7 = (unsigned long)ptep;
+    /* Pass state to after hook (page ref still held). */
+    local->data0 = (unsigned long)page;
+    local->data1 = orig_pte;
+    local->data2 = (unsigned long)ptep;
 }
 
-static void follow_page_pte_after_impl(hook_fargs5_t *args, void *udata)
+static void gup_hide_after(hook_local_t *local, void *vma,
+                           unsigned long address)
 {
-    struct wxshadow_page *page = (void *)args->arg5;
+    struct wxshadow_page *page = (void *)local->data0;
     u64 orig_pte;
     u64 *ptep;
-    void *vma;
 
     if (!page)
         return;
 
-    orig_pte = (u64)args->arg6;
-    ptep = (u64 *)args->arg7;
-    vma = (void *)args->arg0;
+    orig_pte = (u64)local->data1;
+    ptep = (u64 *)local->data2;
 
-    wxshadow_page_finish_gup_hide(page, vma, page->page_addr, ptep, orig_pte);
+    wxshadow_page_finish_gup_hide(page, vma, address & PAGE_MASK, ptep,
+                                  orig_pte);
     wxshadow_page_put(page);  /* release ref from before hook */
+}
+
+static void follow_page_pte_before_impl(hook_fargs5_t *args, void *udata)
+{
+    (void)udata;
+    gup_hide_before(&args->local, (void *)args->arg0,
+                    (unsigned long)args->arg1,
+                    (unsigned int)(unsigned long)args->arg3);
+}
+
+static void follow_page_pte_after_impl(hook_fargs5_t *args, void *udata)
+{
+    (void)udata;
+    gup_hide_after(&args->local, (void *)args->arg0,
+                   (unsigned long)args->arg1);
 }
 
 void follow_page_pte_before(hook_fargs5_t *args, void *udata)
@@ -285,6 +350,35 @@ void follow_page_pte_after(hook_fargs5_t *args, void *udata)
 {
     WX_HANDLER_ENTER();
     follow_page_pte_after_impl(args, udata);
+    WX_HANDLER_EXIT();
+}
+
+static void follow_page_mask_before_impl(hook_fargs4_t *args, void *udata)
+{
+    (void)udata;
+    gup_hide_before(&args->local, (void *)args->arg0,
+                    (unsigned long)args->arg1,
+                    (unsigned int)(unsigned long)args->arg2);
+}
+
+static void follow_page_mask_after_impl(hook_fargs4_t *args, void *udata)
+{
+    (void)udata;
+    gup_hide_after(&args->local, (void *)args->arg0,
+                   (unsigned long)args->arg1);
+}
+
+void follow_page_mask_before(hook_fargs4_t *args, void *udata)
+{
+    WX_HANDLER_ENTER();
+    follow_page_mask_before_impl(args, udata);
+    WX_HANDLER_EXIT();
+}
+
+void follow_page_mask_after(hook_fargs4_t *args, void *udata)
+{
+    WX_HANDLER_ENTER();
+    follow_page_mask_after_impl(args, udata);
     WX_HANDLER_EXIT();
 }
 

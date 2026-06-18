@@ -182,9 +182,11 @@ extern long (*kfunc_copy_from_kernel_nofault)(void *dst, const void *src, size_t
 
 /* do_page_fault hook */
 extern void *kfunc_do_page_fault;
+extern void *kfunc_handle_mm_fault;
 
-/* follow_page_pte hook (GUP hiding) */
+/* GUP hiding hooks */
 extern void *kfunc_follow_page_pte;
+extern void *kfunc_follow_page_mask;
 
 /* fork protection hooks */
 extern void *kfunc_dup_mmap;
@@ -584,8 +586,11 @@ void after_copy_process_wx(hook_fargs8_t *args, void *udata);
 int wxshadow_handle_read_fault(void *mm, unsigned long addr);
 int wxshadow_handle_exec_fault(void *mm, unsigned long addr);
 void do_page_fault_before(hook_fargs3_t *args, void *udata);
+void handle_mm_fault_before(hook_fargs4_t *args, void *udata);
 void follow_page_pte_before(hook_fargs5_t *args, void *udata);
 void follow_page_pte_after(hook_fargs5_t *args, void *udata);
+void follow_page_mask_before(hook_fargs4_t *args, void *udata);
+void follow_page_mask_after(hook_fargs4_t *args, void *udata);
 void exit_mmap_before(hook_fargs1_t *args, void *udata);
 int wxshadow_brk_handler(struct pt_regs *regs, unsigned int esr);
 int wxshadow_step_handler(struct pt_regs *regs, unsigned int esr);
