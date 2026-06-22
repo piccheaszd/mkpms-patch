@@ -17,6 +17,7 @@
 #include <linux/string.h>
 #include <linux/mm_types.h>
 #include <linux/kallsyms.h>
+#include <linux/rculist.h>
 #include <linux/err.h>
 #include <hook.h>
 #include <syscall.h>
@@ -59,9 +60,13 @@ extern struct task_struct_offset task_struct_offset;
 #define PR_RECOMPILE_REGISTER 0x52430001UL
 #define PR_RECOMPILE_RELEASE  0x52430002UL
 
-#define RC_MAX_MAPPINGS 128
+#define RC_GFP_KERNEL 0xcc0U
 #define RC_FORK_FIX_BATCH 64
 #define RC_USER_REGSET_PRSTATUS 1U
+#define RC_DBG_HOOK_HANDLED 0
+#define RC_DBG_HOOK_ERROR 1
+#define RC_SIGTRAP 5
+#define RC_TRAP_TRACE 2
 
 #ifndef CLONE_VM
 #define CLONE_VM 0x00000100UL
@@ -98,6 +103,7 @@ struct rc_lookup_data {
 };
 
 struct rc_mapping {
+    struct list_head list;
     int active;
     void *mm;
     unsigned long orig;
@@ -107,6 +113,11 @@ struct rc_mapping {
     int stripped;
     int deferred;
     int fork_paused;
+};
+
+struct rc_step_hook {
+    struct list_head node;
+    int (*fn)(struct pt_regs *regs, unsigned int esr);
 };
 
 typedef int (*rc_kallsyms_cb3_t)(void *data, const char *name,
@@ -133,6 +144,8 @@ static void (*kfunc___ptep_modify_prot_commit)(void *vma, unsigned long addr,
 static void (*kfunc___split_huge_pmd)(void *vma, void *pmd,
                                       unsigned long address, bool freeze,
                                       void *page);
+static void *(*kfunc_kzalloc)(size_t size, unsigned int flags);
+static void (*kfunc_kfree)(void *ptr);
 static unsigned long (*kfunc___get_free_pages)(unsigned int gfp_mask,
                                                unsigned int order);
 static void (*kfunc_free_pages)(unsigned long addr, unsigned int order);
@@ -158,14 +171,25 @@ static void *kfunc_perf_callchain_user;
 static void *kfunc_perf_bp_event;
 static void *kfunc_single_step_handler;
 static void *kfunc_do_el0_softstep;
-static void *kfunc_register_user_step_hook;
-static void *kfunc_unregister_user_step_hook;
-static void *kfunc_user_rewind_single_step;
-static void *kfunc_arm64_force_sig_fault;
+static void (*kfunc_register_user_step_hook)(struct rc_step_hook *hook);
+static void (*kfunc_unregister_user_step_hook)(struct rc_step_hook *hook);
+static void (*kfunc_user_rewind_single_step)(void *task);
+static void (*kfunc_arm64_force_sig_fault)(int signo, int code,
+                                           unsigned long far,
+                                           const char *str);
+static void (*kfunc_raw_spin_lock)(void *lock);
+static void (*kfunc_raw_spin_unlock)(void *lock);
+static void *kptr_debug_hook_lock;
 static s64 *kvar_memstart_addr;
 static s64 *kvar_physvirt_offset;
 
-static struct rc_mapping rc_mappings[RC_MAX_MAPPINGS];
+static int rc_user_step_hook_fn(struct pt_regs *regs, unsigned int esr);
+
+static LIST_HEAD(rc_mapping_list);
+static int rc_active_mapping_count;
+static struct rc_step_hook rc_user_step_hook = {
+    .fn = rc_user_step_hook_fn,
+};
 static atomic_t rc_lock = ATOMIC_INIT(0);
 static atomic_t rc_in_flight = ATOMIC_INIT(0);
 static int rc_cb_param_style;
@@ -193,6 +217,8 @@ static bool rc_hooked_perf_callchain_user;
 static bool rc_hooked_perf_bp_event;
 static bool rc_hooked_single_step_handler;
 static bool rc_hooked_do_el0_softstep;
+static bool rc_user_step_hook_registered;
+static bool rc_enable_user_step_api;
 
 static inline void rc_cpu_relax(void)
 {
@@ -213,6 +239,17 @@ static void rc_lock_release(void)
 static inline bool rc_is_kva(unsigned long addr)
 {
     return (addr >> 48) == 0xffff;
+}
+
+static bool rc_args_enable_user_step(const char *args)
+{
+    if (!args)
+        return false;
+
+    return strstr(args, "user_step=1") ||
+           strstr(args, "user_step=true") ||
+           strstr(args, "user_step_api=1") ||
+           strstr(args, "user_step_api=true");
 }
 
 static bool rc_safe_read_u64(unsigned long addr, u64 *out)
@@ -712,40 +749,52 @@ static int rc_try_strip_mapping_locked(struct rc_mapping *m, void *vma)
     return 0;
 }
 
-static int rc_find_mapping_locked(void *mm, unsigned long orig)
+static struct rc_mapping *rc_alloc_mapping(void)
 {
-    int i;
+    struct rc_mapping *m;
 
-    for (i = 0; i < RC_MAX_MAPPINGS; i++) {
-        if (rc_mappings[i].active &&
-            rc_mappings[i].mm == mm &&
-            rc_mappings[i].orig == orig)
-            return i;
-    }
-    return -1;
+    if (!kfunc_kzalloc)
+        return NULL;
+
+    m = kfunc_kzalloc(sizeof(*m), RC_GFP_KERNEL);
+    if (!m)
+        return NULL;
+
+    memset(m, 0, sizeof(*m));
+    INIT_LIST_HEAD(&m->list);
+    return m;
 }
 
-static int rc_find_free_mapping_locked(void)
+static void rc_free_mapping(struct rc_mapping *m)
 {
-    int i;
+    if (m && kfunc_kfree)
+        kfunc_kfree(m);
+}
 
-    for (i = 0; i < RC_MAX_MAPPINGS; i++) {
-        if (!rc_mappings[i].active)
-            return i;
+static struct rc_mapping *rc_find_mapping_locked(void *mm, unsigned long orig)
+{
+    struct list_head *pos;
+    struct rc_mapping *m;
+
+    for (pos = rc_mapping_list.next; pos != &rc_mapping_list;
+         pos = pos->next) {
+        m = list_entry(pos, struct rc_mapping, list);
+        if (m->active && m->mm == mm && m->orig == orig)
+            return m;
     }
-    return -1;
+    return NULL;
 }
 
 static bool rc_translate_orig_to_recomp(void *mm, unsigned long pc,
                                         unsigned long *out_pc)
 {
     unsigned long page = rc_page_align(pc);
-    int i;
+    struct rc_mapping *m;
 
     rc_lock_acquire();
-    i = rc_find_mapping_locked(mm, page);
-    if (i >= 0 && rc_mappings[i].stripped) {
-        *out_pc = rc_mappings[i].recomp + (pc - rc_mappings[i].orig);
+    m = rc_find_mapping_locked(mm, page);
+    if (m && m->stripped) {
+        *out_pc = m->recomp + (pc - m->orig);
         rc_lock_release();
         return true;
     }
@@ -756,11 +805,11 @@ static bool rc_translate_orig_to_recomp(void *mm, unsigned long pc,
 static bool rc_has_unstripped_mapping(void *mm, unsigned long pc)
 {
     unsigned long page = rc_page_align(pc);
-    int i;
+    struct rc_mapping *m;
 
     rc_lock_acquire();
-    i = rc_find_mapping_locked(mm, page);
-    if (i >= 0 && !rc_mappings[i].stripped) {
+    m = rc_find_mapping_locked(mm, page);
+    if (m && !m->stripped) {
         rc_lock_release();
         return true;
     }
@@ -771,20 +820,23 @@ static bool rc_has_unstripped_mapping(void *mm, unsigned long pc)
 static bool rc_translate_recomp_to_orig(void *mm, unsigned long pc,
                                         unsigned long *out_pc)
 {
-    int i;
+    struct list_head *pos;
+    struct rc_mapping *m;
 
     rc_lock_acquire();
-    for (i = 0; i < RC_MAX_MAPPINGS; i++) {
+    for (pos = rc_mapping_list.next; pos != &rc_mapping_list;
+         pos = pos->next) {
         unsigned long start;
         unsigned long end;
 
-        if (!rc_mappings[i].active || rc_mappings[i].mm != mm)
+        m = list_entry(pos, struct rc_mapping, list);
+        if (!m->active || m->mm != mm)
             continue;
 
-        start = rc_mappings[i].recomp;
+        start = m->recomp;
         end = start + rc_page_size;
         if (pc >= start && pc < end) {
-            *out_pc = rc_mappings[i].orig + (pc - start);
+            *out_pc = m->orig + (pc - start);
             rc_lock_release();
             return true;
         }
@@ -793,18 +845,37 @@ static bool rc_translate_recomp_to_orig(void *mm, unsigned long pc,
     return false;
 }
 
-static int rc_restore_mapping_locked(int idx, const char *reason)
+static void rc_detach_mapping_locked(struct rc_mapping *m)
 {
-    struct rc_mapping *m = &rc_mappings[idx];
+    if (!m || !m->active)
+        return;
+
+    m->active = 0;
+    if (rc_active_mapping_count > 0)
+        rc_active_mapping_count--;
+    list_del_init(&m->list);
+}
+
+static int rc_restore_mapping_locked(struct rc_mapping *m, const char *reason)
+{
     u64 *ptep;
     u64 cur;
     void *vma;
+    unsigned long orig;
+    unsigned long recomp;
     bool restored = false;
+
+    if (!m)
+        return RC_EINVAL;
+
+    orig = m->orig;
+    recomp = m->recomp;
 
     if (!m->stripped) {
         pr_info("recompile: [%s] cleaned deferred mapping %lx->%lx\n",
-                reason, m->orig, m->recomp);
-        memset(m, 0, sizeof(*m));
+                reason, orig, recomp);
+        rc_detach_mapping_locked(m);
+        rc_free_mapping(m);
         return 0;
     }
 
@@ -819,28 +890,35 @@ static int rc_restore_mapping_locked(int idx, const char *reason)
     }
 
     pr_info("recompile: [%s] cleaned mapping %lx->%lx%s\n",
-            reason, m->orig, m->recomp, restored ? "" : " (pte skipped)");
-    memset(m, 0, sizeof(*m));
+            reason, orig, recomp, restored ? "" : " (pte skipped)");
+    rc_detach_mapping_locked(m);
+    rc_free_mapping(m);
     return restored ? 0 : RC_EFAULT;
 }
 
 static int rc_release_mm(void *mm, unsigned long orig, const char *reason)
 {
     int ret = RC_ENOENT;
-    int i;
+    struct rc_mapping *m;
 
     rc_lock_acquire();
     if (orig) {
         unsigned long page = rc_page_align(orig);
 
-        i = rc_find_mapping_locked(mm, page);
-        if (i >= 0)
-            ret = rc_restore_mapping_locked(i, reason);
+        m = rc_find_mapping_locked(mm, page);
+        if (m)
+            ret = rc_restore_mapping_locked(m, reason);
     } else {
+        struct list_head *pos;
+        struct list_head *next;
+
         ret = 0;
-        for (i = 0; i < RC_MAX_MAPPINGS; i++) {
-            if (rc_mappings[i].active && rc_mappings[i].mm == mm)
-                rc_restore_mapping_locked(i, reason);
+        for (pos = rc_mapping_list.next; pos != &rc_mapping_list;
+             pos = next) {
+            next = pos->next;
+            m = list_entry(pos, struct rc_mapping, list);
+            if (m->active && m->mm == mm)
+                rc_restore_mapping_locked(m, reason);
         }
     }
     rc_lock_release();
@@ -873,12 +951,12 @@ static int rc_do_register(void *mm, unsigned long orig, unsigned long recomp)
 {
     unsigned long orig_page = rc_page_align(orig);
     unsigned long recomp_page = rc_page_align(recomp);
+    struct rc_mapping *mapping = NULL;
     u64 *ptep;
     u64 old_pte;
     u64 hidden_pte;
     void *vma;
     bool deferred = false;
-    int idx;
     int ret = 0;
 
     if (!mm || !orig_page || !recomp_page)
@@ -887,7 +965,7 @@ static int rc_do_register(void *mm, unsigned long orig, unsigned long recomp)
         return RC_EINVAL;
 
     rc_lock_acquire();
-    if (rc_find_mapping_locked(mm, orig_page) >= 0) {
+    if (rc_find_mapping_locked(mm, orig_page)) {
         rc_lock_release();
         return RC_EEXIST;
     }
@@ -930,27 +1008,27 @@ static int rc_do_register(void *mm, unsigned long orig, unsigned long recomp)
     if (!deferred)
         hidden_pte = old_pte | PTE_UXN;
 
+    mapping = rc_alloc_mapping();
+    if (!mapping)
+        return RC_ENOMEM;
+
     rc_lock_acquire();
-    if (rc_find_mapping_locked(mm, orig_page) >= 0) {
+    if (rc_find_mapping_locked(mm, orig_page)) {
         ret = RC_EEXIST;
         goto out_unlock;
     }
 
-    idx = rc_find_free_mapping_locked();
-    if (idx < 0) {
-        ret = RC_ENOMEM;
-        goto out_unlock;
-    }
-
-    rc_mappings[idx].active = 1;
-    rc_mappings[idx].mm = mm;
-    rc_mappings[idx].orig = orig_page;
-    rc_mappings[idx].recomp = recomp_page;
-    rc_mappings[idx].orig_pte = old_pte;
-    rc_mappings[idx].hidden_pte = hidden_pte;
-    rc_mappings[idx].stripped = deferred ? 0 : 1;
-    rc_mappings[idx].deferred = deferred ? 1 : 0;
-    rc_mappings[idx].fork_paused = 0;
+    mapping->active = 1;
+    mapping->mm = mm;
+    mapping->orig = orig_page;
+    mapping->recomp = recomp_page;
+    mapping->orig_pte = old_pte;
+    mapping->hidden_pte = hidden_pte;
+    mapping->stripped = deferred ? 0 : 1;
+    mapping->deferred = deferred ? 1 : 0;
+    mapping->fork_paused = 0;
+    list_add_tail(&mapping->list, &rc_mapping_list);
+    rc_active_mapping_count++;
 
     if (deferred) {
         pr_info("recompile: deferred strip for %lx (PTE absent, will strip on first fault-in)\n",
@@ -961,9 +1039,12 @@ static int rc_do_register(void *mm, unsigned long orig, unsigned long recomp)
 
     pr_info("recompile: registered mapping: %lx -> %lx (pid mm=%px)\n",
             orig_page, recomp_page, mm);
+    mapping = NULL;
 
 out_unlock:
     rc_lock_release();
+    if (mapping)
+        rc_free_mapping(mapping);
     return ret;
 }
 
@@ -1048,7 +1129,7 @@ static void recompile_fault_after(hook_fargs3_t *args, void *udata)
     unsigned long page;
     void *mm;
     void *vma;
-    int idx;
+    struct rc_mapping *m;
     int ret;
 
     (void)udata;
@@ -1072,11 +1153,11 @@ static void recompile_fault_after(hook_fargs3_t *args, void *udata)
         vma = NULL;
 
     rc_lock_acquire();
-    idx = rc_find_mapping_locked(mm, page);
-    if (idx >= 0 && !rc_mappings[idx].stripped) {
-        ret = rc_try_strip_mapping_locked(&rc_mappings[idx], vma);
+    m = rc_find_mapping_locked(mm, page);
+    if (m && !m->stripped) {
+        ret = rc_try_strip_mapping_locked(m, vma);
         if (ret == 0) {
-            regs->pc = rc_mappings[idx].recomp + (fault_pc - page);
+            regs->pc = m->recomp + (fault_pc - page);
         } else if (ret < 0) {
             pr_warn("recompile: deferred strip failed for %lx: %d\n",
                     page, ret);
@@ -1090,11 +1171,10 @@ out:
     atomic_dec(&rc_in_flight);
 }
 
-static void rc_sanitize_regs_pc_shared(hook_local_t *local,
+static void rc_sanitize_regs_pc_for_mm(void *mm, hook_local_t *local,
                                        struct pt_regs *regs)
 {
     unsigned long orig_pc;
-    void *mm;
 
     if (!local)
         return;
@@ -1103,7 +1183,6 @@ static void rc_sanitize_regs_pc_shared(hook_local_t *local,
     if (!regs || !user_mode(regs))
         return;
 
-    mm = kfunc_get_task_mm(current);
     if (!mm)
         return;
 
@@ -1114,7 +1193,21 @@ static void rc_sanitize_regs_pc_shared(hook_local_t *local,
         local->data3 = orig_pc;
         regs->pc = orig_pc;
     }
+}
 
+static void rc_sanitize_regs_pc_shared(hook_local_t *local,
+                                       struct pt_regs *regs)
+{
+    void *mm;
+
+    mm = kfunc_get_task_mm(current);
+    if (!mm) {
+        if (local)
+            local->data0 = 0;
+        return;
+    }
+
+    rc_sanitize_regs_pc_for_mm(mm, local, regs);
     kfunc_mmput(mm);
 }
 
@@ -1134,7 +1227,6 @@ static void rc_sanitize_task_pc_shared(hook_local_t *local,
                                        struct task_struct *task)
 {
     struct pt_regs *regs;
-    unsigned long orig_pc;
     void *mm;
 
     if (!local)
@@ -1152,13 +1244,40 @@ static void rc_sanitize_task_pc_shared(hook_local_t *local,
     if (!mm)
         return;
 
-    if (rc_translate_recomp_to_orig(mm, regs->pc, &orig_pc)) {
-        local->data0 = 1;
-        local->data1 = regs->pc;
-        local->data2 = (u64)(unsigned long)regs;
-        local->data3 = orig_pc;
-        regs->pc = orig_pc;
+    rc_sanitize_regs_pc_for_mm(mm, local, regs);
+}
+
+static int rc_user_step_hook_fn(struct pt_regs *regs, unsigned int esr)
+{
+    hook_local_t local;
+    void *mm;
+
+    (void)esr;
+
+    if (!regs || !user_mode(regs))
+        return RC_DBG_HOOK_ERROR;
+    if (!rc_active_mapping_count)
+        return RC_DBG_HOOK_ERROR;
+
+    atomic_inc(&rc_in_flight);
+    memset(&local, 0, sizeof(local));
+
+    mm = rc_task_mm_borrowed(current);
+    rc_sanitize_regs_pc_for_mm(mm, &local, regs);
+    if (!local.data0) {
+        atomic_dec(&rc_in_flight);
+        return RC_DBG_HOOK_ERROR;
     }
+
+    if (kfunc_arm64_force_sig_fault)
+        kfunc_arm64_force_sig_fault(RC_SIGTRAP, RC_TRAP_TRACE, regs->pc,
+                                    "recompile");
+    if (kfunc_user_rewind_single_step)
+        kfunc_user_rewind_single_step(current);
+
+    rc_restore_sanitized_pc_shared(&local);
+    atomic_dec(&rc_in_flight);
+    return RC_DBG_HOOK_HANDLED;
 }
 
 static bool rc_regset_is_prstatus(void *regset)
@@ -1349,12 +1468,13 @@ static void recompile_regs2_arg1_after(hook_fargs2_t *args, void *udata)
 
 static int rc_pause_mm_for_fork(void *mm)
 {
-    int i;
+    struct list_head *pos;
     int changed = 0;
 
     rc_lock_acquire();
-    for (i = 0; i < RC_MAX_MAPPINGS; i++) {
-        struct rc_mapping *m = &rc_mappings[i];
+    for (pos = rc_mapping_list.next; pos != &rc_mapping_list;
+         pos = pos->next) {
+        struct rc_mapping *m = list_entry(pos, struct rc_mapping, list);
         u64 *ptep;
         u64 cur;
         void *vma;
@@ -1386,12 +1506,13 @@ static int rc_pause_mm_for_fork(void *mm)
 
 static int rc_resume_mm_after_fork(void *mm)
 {
-    int i;
+    struct list_head *pos;
     int changed = 0;
 
     rc_lock_acquire();
-    for (i = 0; i < RC_MAX_MAPPINGS; i++) {
-        struct rc_mapping *m = &rc_mappings[i];
+    for (pos = rc_mapping_list.next; pos != &rc_mapping_list;
+         pos = pos->next) {
+        struct rc_mapping *m = list_entry(pos, struct rc_mapping, list);
         u64 *ptep;
         u64 cur;
         void *vma;
@@ -1430,13 +1551,15 @@ static int rc_fix_child_ptes(void *child_mm, void *parent_mm)
     int count = 0;
     int fixed = 0;
     int i;
+    struct list_head *pos;
 
     if (!child_mm || !parent_mm || child_mm == parent_mm)
         return 0;
 
     rc_lock_acquire();
-    for (i = 0; i < RC_MAX_MAPPINGS; i++) {
-        struct rc_mapping *m = &rc_mappings[i];
+    for (pos = rc_mapping_list.next; pos != &rc_mapping_list;
+         pos = pos->next) {
+        struct rc_mapping *m = list_entry(pos, struct rc_mapping, list);
 
         if (!m->active || m->mm != parent_mm || !m->stripped)
             continue;
@@ -1569,8 +1692,9 @@ static void after_copy_process_rc(hook_fargs8_t *args, void *udata)
 static void recompile_exit_mmap_before(hook_fargs1_t *args, void *udata)
 {
     void *mm = (void *)args->arg0;
+    struct list_head *pos;
+    struct list_head *next;
     int cleaned = 0;
-    int i;
 
     (void)udata;
     atomic_inc(&rc_in_flight);
@@ -1579,9 +1703,13 @@ static void recompile_exit_mmap_before(hook_fargs1_t *args, void *udata)
         goto out;
 
     rc_lock_acquire();
-    for (i = 0; i < RC_MAX_MAPPINGS; i++) {
-        if (rc_mappings[i].active && rc_mappings[i].mm == mm) {
-            rc_restore_mapping_locked(i, "exit_mmap");
+    for (pos = rc_mapping_list.next; pos != &rc_mapping_list;
+         pos = next) {
+        struct rc_mapping *m = list_entry(pos, struct rc_mapping, list);
+
+        next = pos->next;
+        if (m->active && m->mm == mm) {
+            rc_restore_mapping_locked(m, "exit_mmap");
             cleaned++;
         }
     }
@@ -1613,15 +1741,69 @@ static void rc_wait_for_handlers_drain(const char *phase)
     }
 }
 
+static int rc_register_user_step_hook_api(void)
+{
+    bool can_manual_unregister;
+
+    if (!kfunc_register_user_step_hook)
+        return RC_ENOSYS;
+
+    can_manual_unregister = kptr_debug_hook_lock && kfunc_raw_spin_lock &&
+                            kfunc_raw_spin_unlock;
+    if (!can_manual_unregister && !kfunc_unregister_user_step_hook) {
+        pr_warn("recompile: register_user_step_hook available but no unregister path\n");
+        return RC_ENOSYS;
+    }
+
+    INIT_LIST_HEAD(&rc_user_step_hook.node);
+    rc_user_step_hook.fn = rc_user_step_hook_fn;
+    kfunc_register_user_step_hook(&rc_user_step_hook);
+    rc_user_step_hook_registered = true;
+
+    if (!kptr_debug_hook_lock)
+        pr_warn("recompile: debug_hook_lock not found, falling back to unregister_user_step_hook on unload\n");
+    else if (!can_manual_unregister)
+        pr_warn("recompile: raw spin lock helpers missing, falling back to unregister_user_step_hook on unload\n");
+
+    pr_info("recompile: registered user_step_hook API\n");
+    return 0;
+}
+
+static void rc_unregister_user_step_hook_manual(void)
+{
+    if (!rc_user_step_hook_registered)
+        return;
+
+    if (kptr_debug_hook_lock && kfunc_raw_spin_lock &&
+        kfunc_raw_spin_unlock) {
+        kfunc_raw_spin_lock(kptr_debug_hook_lock);
+        list_del_rcu(&rc_user_step_hook.node);
+        kfunc_raw_spin_unlock(kptr_debug_hook_lock);
+    } else if (kfunc_unregister_user_step_hook) {
+        kfunc_unregister_user_step_hook(&rc_user_step_hook);
+    } else {
+        pr_err("recompile: no available user_step_hook unregister path\n");
+        return;
+    }
+
+    rc_user_step_hook_registered = false;
+    INIT_LIST_HEAD(&rc_user_step_hook.node);
+}
+
 static int rc_restore_all(const char *reason)
 {
+    struct list_head *pos;
+    struct list_head *next;
     int cleaned = 0;
-    int i;
 
     rc_lock_acquire();
-    for (i = 0; i < RC_MAX_MAPPINGS; i++) {
-        if (rc_mappings[i].active) {
-            rc_restore_mapping_locked(i, reason);
+    for (pos = rc_mapping_list.next; pos != &rc_mapping_list;
+         pos = next) {
+        struct rc_mapping *m = list_entry(pos, struct rc_mapping, list);
+
+        next = pos->next;
+        if (m->active) {
+            rc_restore_mapping_locked(m, reason);
             cleaned++;
         }
     }
@@ -1660,6 +1842,11 @@ static int rc_resolve_symbols(void)
     kfunc___split_huge_pmd =
         (typeof(kfunc___split_huge_pmd))
             rc_lookup_name_safe("__split_huge_pmd");
+    kfunc_kzalloc = (typeof(kfunc_kzalloc))rc_lookup_name_safe("kzalloc");
+    if (!kfunc_kzalloc)
+        kfunc_kzalloc =
+            (typeof(kfunc_kzalloc))rc_lookup_name_safe("__kmalloc");
+    kfunc_kfree = (typeof(kfunc_kfree))rc_lookup_name_safe("kfree");
     kfunc___get_free_pages =
         (typeof(kfunc___get_free_pages))
             rc_lookup_name_safe("__get_free_pages");
@@ -1705,13 +1892,30 @@ static int rc_resolve_symbols(void)
         (void *)rc_lookup_name_safe("single_step_handler");
     kfunc_do_el0_softstep = (void *)rc_lookup_name_safe("do_el0_softstep");
     kfunc_register_user_step_hook =
-        (void *)rc_lookup_name_safe("register_user_step_hook");
+        (typeof(kfunc_register_user_step_hook))
+            rc_lookup_name_safe("register_user_step_hook");
     kfunc_unregister_user_step_hook =
-        (void *)rc_lookup_name_safe("unregister_user_step_hook");
+        (typeof(kfunc_unregister_user_step_hook))
+            rc_lookup_name_safe("unregister_user_step_hook");
     kfunc_user_rewind_single_step =
-        (void *)rc_lookup_name_safe("user_rewind_single_step");
+        (typeof(kfunc_user_rewind_single_step))
+            rc_lookup_name_safe("user_rewind_single_step");
     kfunc_arm64_force_sig_fault =
-        (void *)rc_lookup_name_safe("arm64_force_sig_fault");
+        (typeof(kfunc_arm64_force_sig_fault))
+            rc_lookup_name_safe("arm64_force_sig_fault");
+    kfunc_raw_spin_lock =
+        (typeof(kfunc_raw_spin_lock))rc_lookup_name_safe("_raw_spin_lock");
+    if (!kfunc_raw_spin_lock)
+        kfunc_raw_spin_lock =
+            (typeof(kfunc_raw_spin_lock))
+                rc_lookup_name_safe("__raw_spin_lock");
+    kfunc_raw_spin_unlock =
+        (typeof(kfunc_raw_spin_unlock))rc_lookup_name_safe("_raw_spin_unlock");
+    if (!kfunc_raw_spin_unlock)
+        kfunc_raw_spin_unlock =
+            (typeof(kfunc_raw_spin_unlock))
+                rc_lookup_name_safe("__raw_spin_unlock");
+    kptr_debug_hook_lock = (void *)rc_lookup_name_safe("debug_hook_lock");
 
     kfunc_find_task_by_vpid =
         (typeof(kfunc_find_task_by_vpid))
@@ -1729,10 +1933,11 @@ static int rc_resolve_symbols(void)
         (s64 *)rc_lookup_name_safe("memstart_addr");
 
     if (!kfunc_find_vma || !kfunc_get_task_mm || !kfunc_mmput ||
+        !kfunc_kzalloc || !kfunc_kfree ||
         !kfunc_fault_handler || !kfunc_exit_mmap)
         return RC_ENOSYS;
 
-    pr_info("recompile: symbols resolved (fault=%px setup_sigframe=%px setup_rt_frame=%px compat_frame=%px/%px/%px do_signal=%px regset=%px/%px/%px perf=%px/%px/%px bp=%px step=%px/%px api=%px/%px rewind=%px force_sig=%px flush=%px range=%px split_pmd=%px pages=%px/%px dup_mmap=%px copy_process=%px)\n",
+    pr_info("recompile: symbols resolved (fault=%px setup_sigframe=%px setup_rt_frame=%px compat_frame=%px/%px/%px do_signal=%px regset=%px/%px/%px perf=%px/%px/%px bp=%px step=%px/%px api=%px/%px rewind=%px force_sig=%px debug_lock=%px raw_spin=%px/%px alloc=%px/%px flush=%px range=%px split_pmd=%px pages=%px/%px dup_mmap=%px copy_process=%px)\n",
             kfunc_fault_handler, kfunc_setup_sigframe,
             kfunc_setup_rt_frame, kfunc_compat_setup_sigframe,
             kfunc_compat_setup_rt_frame, kfunc_compat_setup_frame,
@@ -1743,7 +1948,9 @@ static int rc_resolve_symbols(void)
             kfunc_perf_bp_event, kfunc_single_step_handler,
             kfunc_do_el0_softstep, kfunc_register_user_step_hook,
             kfunc_unregister_user_step_hook, kfunc_user_rewind_single_step,
-            kfunc_arm64_force_sig_fault, kfunc_flush_tlb_page,
+            kfunc_arm64_force_sig_fault, kptr_debug_hook_lock,
+            kfunc_raw_spin_lock, kfunc_raw_spin_unlock, kfunc_kzalloc,
+            kfunc_kfree, kfunc_flush_tlb_page,
             kfunc___flush_tlb_range, kfunc___split_huge_pmd,
             kfunc___get_free_pages, kfunc_free_pages, kfunc_dup_mmap,
             kfunc_copy_process);
@@ -1761,6 +1968,7 @@ static long recompile_init(const char *args, const char *event,
     (void)reserved;
 
     pr_info("recompile: initializing open-source core...\n");
+    rc_enable_user_step_api = rc_args_enable_user_step(args);
 
     ret = rc_resolve_symbols();
     if (ret < 0)
@@ -1951,7 +2159,10 @@ static long recompile_init(const char *args, const char *event,
         }
     }
 
-    if (kfunc_single_step_handler) {
+    if (rc_enable_user_step_api && kfunc_register_user_step_hook)
+        rc_register_user_step_hook_api();
+
+    if (!rc_user_step_hook_registered && kfunc_single_step_handler) {
         err = hook_wrap3(kfunc_single_step_handler,
                          recompile_regs3_arg2_before,
                          recompile_regs3_arg2_after, NULL);
@@ -1997,7 +2208,8 @@ static long recompile_init(const char *args, const char *event,
         }
     }
 
-    pr_info("recompile: module loaded\n");
+    pr_info("recompile: module loaded (user_step_api=%d)\n",
+            rc_enable_user_step_api ? 1 : 0);
     return 0;
 }
 
@@ -2009,6 +2221,11 @@ static long recompile_exit(void *__user reserved)
 
     unhook_syscalln(__NR_prctl, recompile_prctl_before, NULL);
     rc_wait_for_handlers_drain("phase1-prctl");
+
+    if (rc_user_step_hook_registered) {
+        rc_unregister_user_step_hook_manual();
+        rc_wait_for_handlers_drain("phase0-user_step_hook");
+    }
 
     cleaned = rc_restore_all("module unload");
 

@@ -22,11 +22,14 @@ validated release binary's observed RECOMP behavior. It implements:
 - Deferred stripping for pages whose PTE is not present at registration time;
   the fault after-hook strips the PTE after the kernel faults the page in.
 - PMD block splitting through `__split_huge_pmd` when exported.
+- Dynamic per-mm mapping tracking through kernel allocation instead of a fixed
+  slot table.
 - `exit_mmap` cleanup, fork-time parent PTE pause/resume, and child-mm PTE
   repair through `dup_mmap` or `copy_process`.
 - Best-effort PC export sanitization for `setup_sigframe`, `setup_rt_frame`,
   `compat_setup_sigframe`, `compat_setup_rt_frame`, `compat_setup_frame`,
-  `do_signal`, regset helpers, perf helpers, `single_step_handler`, and
+  `do_signal`, regset helpers, perf helpers, optional registered
+  `register_user_step_hook`, fallback `single_step_handler`, and
   `do_el0_softstep` when those symbols are exported.
 
 Known limitations:
@@ -34,11 +37,12 @@ Known limitations:
 - This is not a byte-identical clone of the release binary.
 - Hook availability depends on exported kallsyms on the target kernel; missing
   optional symbols degrade only the corresponding PC export guard surface.
-- `register_user_step_hook`, `unregister_user_step_hook`,
-  `user_rewind_single_step`, and `arm64_force_sig_fault` are resolved and
-  reported for interface visibility, but the source implementation currently
-  relies on the direct `single_step_handler` / `do_el0_softstep` hooks for PC
-  sanitization.
+- The registered user-step path is implemented but opt-in through KPM args
+  (`user_step=1` or `user_step_api=1`). The default source artifact uses the
+  direct `single_step_handler` fallback; boot-loaded user-step builds were
+  validated separately. Runtime unload/load of `recompile` is not a reliable
+  test path on the validated device because unloading the module can leave the
+  KPatch-Next management interface in a bad state before the next load.
 
 Build the source artifact with the repository CMake flow; the output is
 `build/kpms/recompile/recompile.kpm`.
@@ -75,7 +79,7 @@ releases and verifies the original page returns `7` again.
 Latest source-built device-tested SHA-256:
 
 ```text
-66544ac2023d3bd8d4e4b41f8cf19f2718e685b075c02baf132a4ebbb47ca4b5
+cd0bd34e11a7967292cc377a8b7be3214777bac191b4c0f7520700eab676db41
 ```
 
 The source artifact was validated on-device against the reference behavior with:
@@ -96,6 +100,10 @@ The source artifact was validated on-device against the reference behavior with:
   mapping cleanup. Same-thread `NativeFunction` self-calls may report
   `hits=0` because rustFrida skips JS callbacks there to avoid QuickJS
   re-entry; this is not a RECOMP registration failure.
+- A boot-loaded user-step test artifact also passed `kpatch-next kpm
+  num/list/info`, `recompile_prctl_smoke`, and rustFrida `--spawn-early`
+  `Hook.RECOMP` against `libm.so!atan2`. The test artifact SHA-256 was
+  `685dc18fb9bebe589d9471a7d4fdabc394a0a1f500d9beb55225548f0e9c1df8`.
 
 Expected dmesg markers for a working artifact:
 
