@@ -15,6 +15,7 @@
 #include <linux/string.h>
 #include <linux/sched.h>
 #include <syscall.h>
+#include <hook.h>
 #include <kputils.h>
 #include <kallsyms.h>
 #include <asm/current.h>
@@ -22,7 +23,7 @@
 #include "../common/kpm_demo_helpers.h"
 
 KPM_MODULE_INFO("anti-detect",
-                "1.2.21",
+                "1.2.25",
                 "GPL v2",
                 "wwb",
                 "Hide emulator, KernelPatch, and instrumentation artifacts from apps");
@@ -57,6 +58,9 @@ static void *(*kfn_find_vma)(void *mm, unsigned long addr);
 static void *(*kfn_get_task_mm)(void *task);
 static void (*kfn_mmput)(void *mm);
 static char *(*kfn_d_path)(const void *path, char *buf, int buflen);
+static void *(*kfn_fget)(unsigned int fd);
+static void (*kfn_fput)(void *file);
+static void *kfn_exit_mmap;
 
 /* GFP_KERNEL = 0xcc0 on most kernels */
 #define GFP_KERNEL_VAL 0xcc0
@@ -70,8 +74,40 @@ static char *(*kfn_d_path)(const void *path, char *buf, int buflen);
 #define VMA_VM_FILE_OFFSET  0x88
 #define FILE_F_PATH_OFFSET  0x10
 #define CALLER_PATH_BUF_SIZE 1024
+#define FD_PATH_BUF_SIZE 1024
 #define READ_SANITIZE_MAX (64 * 1024)
 #define MAX_ERRNO_VALUE 4095UL
+#define AD_MAX_PROFILES 64
+
+#define PR_ANTIDETECT_REGISTER 0x41440001UL
+#define PR_ANTIDETECT_RELEASE  0x41440002UL
+
+#define AD_F_AUDIT_ONLY       (1UL << 0)
+#define AD_F_HIDE_PATHS       (1UL << 1)
+#define AD_F_HIDE_LINKS       (1UL << 2)
+#define AD_F_FILTER_DIRS      (1UL << 3)
+#define AD_F_FILTER_STATUS    (1UL << 4)
+#define AD_F_GUARD_PTRACE     (1UL << 5)
+#define AD_F_GUARD_DUMPABLE   (1UL << 6)
+#define AD_F_BLOCK_SELF_EXIT  (1UL << 7)
+#define AD_F_BLOCK_SELF_KILL  (1UL << 8)
+#define AD_F_FEATURE_MASK     (AD_F_HIDE_PATHS | AD_F_HIDE_LINKS | \
+                               AD_F_FILTER_DIRS | AD_F_FILTER_STATUS | \
+                               AD_F_GUARD_PTRACE | AD_F_GUARD_DUMPABLE | \
+                               AD_F_BLOCK_SELF_EXIT | AD_F_BLOCK_SELF_KILL)
+#define AD_F_ALLOWED_MASK     (AD_F_AUDIT_ONLY | AD_F_FEATURE_MASK)
+
+enum anti_detect_event {
+    AD_EVT_PATH_HIT,
+    AD_EVT_LINK_HIT,
+    AD_EVT_DIRENT_HIT,
+    AD_EVT_TRACERPID_HIT,
+    AD_EVT_PTRACE_TRACEME,
+    AD_EVT_PR_GET_DUMPABLE,
+    AD_EVT_EXIT_BYPASS,
+    AD_EVT_KILL_BYPASS,
+    AD_EVT_MAX,
+};
 
 struct linux_dirent64 {
     uint64_t       d_ino;
@@ -79,6 +115,14 @@ struct linux_dirent64 {
     unsigned short d_reclen;
     unsigned char  d_type;
     char           d_name[];
+};
+
+struct anti_detect_profile {
+    int active;
+    void *mm;
+    unsigned long flags;
+    unsigned long profile_id;
+    unsigned long events[AD_EVT_MAX];
 };
 
 static const char * const hidden_path_tokens[] = {
@@ -161,6 +205,298 @@ static const char * const self_protect_loader_tokens[] = {
 
 static uid_t lsposed_manager_uid = (uid_t)-1;
 static uid_t bochk_app_uid = (uid_t)-1;
+static struct anti_detect_profile ad_profiles[AD_MAX_PROFILES];
+static int ad_profiles_lock;
+static int ad_profile_count;
+static int hooked_exit_mmap;
+
+static int should_skip_process(uid_t uid);
+static int is_err_ptr(const void *ptr);
+static int looks_like_kernel_ptr(const void *ptr);
+
+static inline void ad_cpu_relax(void)
+{
+    asm volatile("yield" ::: "memory");
+}
+
+static void ad_lock_profiles(void)
+{
+    while (__sync_lock_test_and_set(&ad_profiles_lock, 1) != 0)
+        ad_cpu_relax();
+}
+
+static void ad_unlock_profiles(void)
+{
+    __sync_lock_release(&ad_profiles_lock);
+}
+
+static unsigned long ad_normalize_flags(unsigned long flags)
+{
+    if (flags == 0)
+        flags |= AD_F_FEATURE_MASK;
+    return flags;
+}
+
+static void ad_log_profile_stats(const char *prefix,
+                                 const struct anti_detect_profile *profile)
+{
+    if (!profile)
+        return;
+
+    pr_info("anti-detect: %s profile id=%lu mm=%px flags=0x%lx path=%lu link=%lu dir=%lu tracerpid=%lu ptrace=%lu dumpable=%lu exit=%lu kill=%lu\n",
+            prefix, profile->profile_id, profile->mm, profile->flags,
+            profile->events[AD_EVT_PATH_HIT],
+            profile->events[AD_EVT_LINK_HIT],
+            profile->events[AD_EVT_DIRENT_HIT],
+            profile->events[AD_EVT_TRACERPID_HIT],
+            profile->events[AD_EVT_PTRACE_TRACEME],
+            profile->events[AD_EVT_PR_GET_DUMPABLE],
+            profile->events[AD_EVT_EXIT_BYPASS],
+            profile->events[AD_EVT_KILL_BYPASS]);
+}
+
+static void ad_copy_profile(struct anti_detect_profile *dst,
+                            const struct anti_detect_profile *src)
+{
+    int i;
+
+    if (!dst || !src)
+        return;
+
+    dst->active = src->active;
+    dst->mm = src->mm;
+    dst->flags = src->flags;
+    dst->profile_id = src->profile_id;
+    for (i = 0; i < AD_EVT_MAX; i++)
+        dst->events[i] = src->events[i];
+}
+
+static int ad_register_profile(void *mm, unsigned long flags,
+                               unsigned long profile_id)
+{
+    int free_slot = -1;
+    int i;
+
+    if (!mm)
+        return -EPERM;
+    if (flags & ~AD_F_ALLOWED_MASK)
+        return -EINVAL;
+
+    flags = ad_normalize_flags(flags);
+
+    ad_lock_profiles();
+    for (i = 0; i < AD_MAX_PROFILES; i++) {
+        struct anti_detect_profile *p = &ad_profiles[i];
+        if (!p->active) {
+            if (free_slot < 0)
+                free_slot = i;
+            continue;
+        }
+        if (p->mm == mm) {
+            p->flags = flags;
+            p->profile_id = profile_id;
+            memset(p->events, 0, sizeof(p->events));
+            ad_unlock_profiles();
+            pr_info("anti-detect: updated profile id=%lu mm=%px flags=0x%lx\n",
+                    profile_id, mm, flags);
+            return 0;
+        }
+    }
+
+    if (free_slot < 0) {
+        ad_unlock_profiles();
+        return -ENOMEM;
+    }
+
+    memset(&ad_profiles[free_slot], 0, sizeof(ad_profiles[free_slot]));
+    ad_profiles[free_slot].active = 1;
+    ad_profiles[free_slot].mm = mm;
+    ad_profiles[free_slot].flags = flags;
+    ad_profiles[free_slot].profile_id = profile_id;
+    ad_profile_count++;
+    ad_unlock_profiles();
+
+    pr_info("anti-detect: registered profile id=%lu mm=%px flags=0x%lx\n",
+            profile_id, mm, flags);
+    return 0;
+}
+
+static int ad_release_profile(void *mm)
+{
+    struct anti_detect_profile released;
+    int found = 0;
+    int i;
+
+    if (!mm)
+        return -EPERM;
+
+    memset(&released, 0, sizeof(released));
+
+    ad_lock_profiles();
+    for (i = 0; i < AD_MAX_PROFILES; i++) {
+        struct anti_detect_profile *p = &ad_profiles[i];
+        if (!p->active || p->mm != mm)
+            continue;
+
+        ad_copy_profile(&released, p);
+        memset(p, 0, sizeof(*p));
+        if (ad_profile_count > 0)
+            ad_profile_count--;
+        found = 1;
+        break;
+    }
+    ad_unlock_profiles();
+
+    if (!found)
+        return -ENOENT;
+
+    ad_log_profile_stats("released", &released);
+    return 0;
+}
+
+static int ad_clear_mm_profiles(void *mm)
+{
+    struct anti_detect_profile released;
+    int removed = 0;
+    int i;
+
+    if (!mm)
+        return 0;
+
+    memset(&released, 0, sizeof(released));
+
+    ad_lock_profiles();
+    for (i = 0; i < AD_MAX_PROFILES; i++) {
+        struct anti_detect_profile *p = &ad_profiles[i];
+        if (!p->active || p->mm != mm)
+            continue;
+
+        ad_copy_profile(&released, p);
+        memset(p, 0, sizeof(*p));
+        if (ad_profile_count > 0)
+            ad_profile_count--;
+        removed++;
+        break;
+    }
+    ad_unlock_profiles();
+
+    if (removed)
+        ad_log_profile_stats("exit_mmap", &released);
+    return removed;
+}
+
+static int ad_current_profile_flags(unsigned long *flags)
+{
+    void *mm;
+    int found = 0;
+    int i;
+
+    if (flags)
+        *flags = 0;
+    if (ad_profile_count <= 0 || !kfn_get_task_mm || !kfn_mmput)
+        return 0;
+
+    mm = kfn_get_task_mm(current);
+    if (!mm)
+        return 0;
+
+    ad_lock_profiles();
+    for (i = 0; i < AD_MAX_PROFILES; i++) {
+        struct anti_detect_profile *p = &ad_profiles[i];
+        if (!p->active || p->mm != mm)
+            continue;
+        if (flags)
+            *flags = p->flags;
+        found = 1;
+        break;
+    }
+    ad_unlock_profiles();
+
+    kfn_mmput(mm);
+    return found;
+}
+
+static void ad_count_event(enum anti_detect_event event)
+{
+    void *mm;
+    int i;
+
+    if (event < 0 || event >= AD_EVT_MAX)
+        return;
+    if (ad_profile_count <= 0 || !kfn_get_task_mm || !kfn_mmput)
+        return;
+
+    mm = kfn_get_task_mm(current);
+    if (!mm)
+        return;
+
+    ad_lock_profiles();
+    for (i = 0; i < AD_MAX_PROFILES; i++) {
+        struct anti_detect_profile *p = &ad_profiles[i];
+        if (!p->active || p->mm != mm)
+            continue;
+        p->events[event]++;
+        break;
+    }
+    ad_unlock_profiles();
+
+    kfn_mmput(mm);
+}
+
+static int ad_should_apply(uid_t uid, unsigned long feature, int *audit_only)
+{
+    unsigned long flags = 0;
+
+    if (audit_only)
+        *audit_only = 0;
+
+    if (ad_current_profile_flags(&flags)) {
+        if ((flags & feature) == 0)
+            return 0;
+        if (audit_only)
+            *audit_only = (flags & AD_F_AUDIT_ONLY) != 0;
+        return 1;
+    }
+
+    if (uid < AID_APP_START || should_skip_process(uid))
+        return 0;
+
+    return 1;
+}
+
+static long ad_register_current(unsigned long flags, unsigned long profile_id)
+{
+    void *mm;
+    int ret;
+
+    if (!kfn_get_task_mm || !kfn_mmput)
+        return -ENOSYS;
+
+    mm = kfn_get_task_mm(current);
+    if (!mm)
+        return -EPERM;
+
+    ret = ad_register_profile(mm, flags, profile_id);
+    kfn_mmput(mm);
+    return ret;
+}
+
+static long ad_release_current(void)
+{
+    void *mm;
+    int ret;
+
+    if (!kfn_get_task_mm || !kfn_mmput)
+        return -ENOSYS;
+
+    mm = kfn_get_task_mm(current);
+    if (!mm)
+        return -EPERM;
+
+    ret = ad_release_profile(mm);
+    kfn_mmput(mm);
+    return ret;
+}
 
 static int contains_any_token(const char *name, const char * const *tokens)
 {
@@ -261,7 +597,8 @@ static int should_hide_link_target(const char *name)
 static void before_stat_syscall(hook_fargs4_t *args, void *udata)
 {
     uid_t uid = current_uid();
-    if (uid < AID_APP_START || should_skip_process(uid)) return;
+    int audit_only = 0;
+    if (!ad_should_apply(uid, AD_F_HIDE_PATHS, &audit_only)) return;
 
     const char __user *ufilename = (const char __user *)syscall_argn(args, 1);
     char buf[FILENAME_BUF_SIZE];
@@ -269,6 +606,9 @@ static void before_stat_syscall(hook_fargs4_t *args, void *udata)
     if (len <= 0) return;
 
     if (should_hide_path(buf)) {
+        ad_count_event(AD_EVT_PATH_HIT);
+        if (audit_only)
+            return;
         args->ret = -ENOENT;
         args->skip_origin = 1;
     }
@@ -278,7 +618,8 @@ static void before_stat_syscall(hook_fargs4_t *args, void *udata)
 static void after_readlinkat_syscall(hook_fargs4_t *args, void *udata)
 {
     uid_t uid = current_uid();
-    if (uid < AID_APP_START || should_skip_process(uid)) return;
+    int audit_only = 0;
+    if (!ad_should_apply(uid, AD_F_HIDE_LINKS, &audit_only)) return;
 
     long ret = (long)args->ret;
     if (ret <= 0) return;
@@ -296,6 +637,9 @@ static void after_readlinkat_syscall(hook_fargs4_t *args, void *udata)
 
     if (should_hide_link_target(buf)) {
         char empty = '\0';
+        ad_count_event(AD_EVT_LINK_HIT);
+        if (audit_only)
+            return;
         compat_copy_to_user(ubuf, &empty, 1);
         args->ret = -ENOENT;
     }
@@ -325,7 +669,8 @@ static int getdents_has_hidden(char __user *ubuf, long len)
 static void after_getdents64(hook_fargs4_t *args, void *udata)
 {
     uid_t uid = current_uid();
-    if (uid < AID_APP_START || should_skip_process(uid)) return;
+    int audit_only = 0;
+    if (!ad_should_apply(uid, AD_F_FILTER_DIRS, &audit_only)) return;
 
     long ret = (long)args->ret;
     if (ret <= 0) return;
@@ -334,6 +679,9 @@ static void after_getdents64(hook_fargs4_t *args, void *udata)
 
     /* Fast path: no hidden entries, skip allocation entirely */
     if (!getdents_has_hidden(ubuf, ret))
+        return;
+    ad_count_event(AD_EVT_DIRENT_HIT);
+    if (audit_only)
         return;
 
     /* Skip filtering for huge buffers to avoid unbounded kmalloc */
@@ -416,15 +764,73 @@ static int sanitize_tracerpid_line(char *buf, long len)
     return changed;
 }
 
+static int string_ends_with(const char *value, const char *suffix)
+{
+    size_t value_len;
+    size_t suffix_len;
+
+    if (!value || !suffix)
+        return 0;
+
+    value_len = strlen(value);
+    suffix_len = strlen(suffix);
+    if (suffix_len > value_len)
+        return 0;
+
+    return memcmp(value + value_len - suffix_len, suffix, suffix_len) == 0;
+}
+
+static int fd_path_is_proc_status(long fd)
+{
+    void *file;
+    char *buf;
+    char *path;
+    int matched = 0;
+
+    if (fd < 0 || !kfn_fget || !kfn_fput || !kfn_d_path ||
+        !kfn_kmalloc || !kfn_kfree)
+        return 0;
+
+    file = kfn_fget((unsigned int)fd);
+    if (!file || is_err_ptr(file) || !looks_like_kernel_ptr(file))
+        return 0;
+
+    buf = kfn_kmalloc(FD_PATH_BUF_SIZE, GFP_KERNEL_VAL);
+    if (!buf)
+        goto out_file;
+
+    path = kfn_d_path((const char *)file + FILE_F_PATH_OFFSET,
+                      buf, FD_PATH_BUF_SIZE);
+    if (!is_err_ptr(path)) {
+        unsigned long p = (unsigned long)path;
+        unsigned long b = (unsigned long)buf;
+
+        if (p >= b && p < b + FD_PATH_BUF_SIZE &&
+            strstr(path, "/proc/") && string_ends_with(path, "/status"))
+            matched = 1;
+    }
+
+    kfn_kfree(buf);
+
+out_file:
+    kfn_fput(file);
+    return matched;
+}
+
 static void after_read_syscall(hook_fargs3_t *args, void *udata)
 {
     uid_t uid = current_uid();
+    int audit_only = 0;
     long ret = (long)args->ret;
+    long fd = (long)syscall_argn(args, 0);
     char __user *ubuf;
     char *kbuf;
 
-    if (uid < AID_APP_START || should_skip_process(uid) ||
+    if (!ad_should_apply(uid, AD_F_FILTER_STATUS, &audit_only) ||
         ret <= 0 || ret > READ_SANITIZE_MAX)
+        return;
+
+    if (!fd_path_is_proc_status(fd))
         return;
 
     ubuf = (char __user *)syscall_argn(args, 1);
@@ -442,7 +848,8 @@ static void after_read_syscall(hook_fargs3_t *args, void *udata)
     kbuf[ret] = '\0';
 
     if (sanitize_tracerpid_line(kbuf, ret)) {
-        if (compat_copy_to_user(ubuf, kbuf, ret) == ret)
+        ad_count_event(AD_EVT_TRACERPID_HIT);
+        if (!audit_only && compat_copy_to_user(ubuf, kbuf, ret) == ret)
             pr_info("anti-detect: sanitized TracerPid for comm=%s uid=%u\n",
                     get_task_comm(current), uid);
     }
@@ -453,9 +860,13 @@ static void after_read_syscall(hook_fargs3_t *args, void *udata)
 static void before_ptrace_syscall(hook_fargs4_t *args, void *udata)
 {
     uid_t uid = current_uid();
-    if (uid < AID_APP_START || should_skip_process(uid)) return;
+    int audit_only = 0;
+    if (!ad_should_apply(uid, AD_F_GUARD_PTRACE, &audit_only)) return;
 
     if ((long)syscall_argn(args, 0) == PTRACE_TRACEME) {
+        ad_count_event(AD_EVT_PTRACE_TRACEME);
+        if (audit_only)
+            return;
         args->ret = 0;
         args->skip_origin = 1;
     }
@@ -463,10 +874,37 @@ static void before_ptrace_syscall(hook_fargs4_t *args, void *udata)
 
 static void before_prctl_syscall(hook_fargs5_t *args, void *udata)
 {
+    unsigned long option = syscall_argn(args, 0);
     uid_t uid = current_uid();
-    if (uid < AID_APP_START || should_skip_process(uid)) return;
+    int audit_only = 0;
+    long ret;
 
-    if ((long)syscall_argn(args, 0) == PR_GET_DUMPABLE) {
+    if (option == PR_ANTIDETECT_REGISTER) {
+        unsigned long pid = syscall_argn(args, 1);
+        unsigned long flags = syscall_argn(args, 2);
+        unsigned long profile_id = syscall_argn(args, 3);
+
+        ret = pid == 0 ? ad_register_current(flags, profile_id) : -EINVAL;
+        args->ret = (u64)ret;
+        args->skip_origin = 1;
+        return;
+    }
+
+    if (option == PR_ANTIDETECT_RELEASE) {
+        unsigned long pid = syscall_argn(args, 1);
+
+        ret = pid == 0 ? ad_release_current() : -EINVAL;
+        args->ret = (u64)ret;
+        args->skip_origin = 1;
+        return;
+    }
+
+    if (!ad_should_apply(uid, AD_F_GUARD_DUMPABLE, &audit_only)) return;
+
+    if ((long)option == PR_GET_DUMPABLE) {
+        ad_count_event(AD_EVT_PR_GET_DUMPABLE);
+        if (audit_only)
+            return;
         args->ret = 0;
         args->skip_origin = 1;
     }
@@ -586,12 +1024,12 @@ static int classify_self_protect_exit(long nr, long status, const char *comm,
     if (nr != __NR_exit && nr != __NR_exit_group)
         return 0;
 
+    if (is_self_protect_exit_status(status) && current_is_bochk_process(uid))
+        return 4;
+
     if (is_self_protect_exit_status(status) &&
         caller_matches_self_protect_loader(pc, lr))
         return 1;
-
-    if (is_self_protect_exit_status(status) && current_is_bochk_process(uid))
-        return 4;
 
     if (status == 0 && comm && strstr(comm, "mo.client") && ((lr & 0xffffUL) == 0xe120UL))
         return 2;
@@ -611,11 +1049,11 @@ static int classify_self_protect_kill(long sig, uid_t uid,
     if (!is_fatal_signal(sig))
         return 0;
 
-    if (caller_matches_self_protect_loader(pc, lr))
-        return 3;
-
     if (current_is_bochk_process(uid))
         return 4;
+
+    if (caller_matches_self_protect_loader(pc, lr))
+        return 3;
 
     return 0;
 }
@@ -623,7 +1061,8 @@ static int classify_self_protect_kill(long sig, uid_t uid,
 static void before_exit_syscall(hook_fargs1_t *args, void *udata)
 {
     uid_t uid = current_uid();
-    if (uid < AID_APP_START || should_skip_process(uid)) return;
+    int audit_only = 0;
+    if (!ad_should_apply(uid, AD_F_BLOCK_SELF_EXIT, &audit_only)) return;
 
     long status = (long)syscall_argn(args, 0);
     struct pt_regs *regs = NULL;
@@ -637,12 +1076,24 @@ static void before_exit_syscall(hook_fargs1_t *args, void *udata)
     if (!regs || !user_mode(regs))
         return;
 
+    /*
+     * Audit-only must stay async-light here. The caller-path classifier walks
+     * current->mm VMAs and calls d_path(); doing that from BOCHK's exit path
+     * was the only extra 0x181 surface when the device became unresponsive.
+     */
+    if (audit_only) {
+        if (is_self_protect_exit_status(status))
+            ad_count_event(AD_EVT_EXIT_BYPASS);
+        return;
+    }
+
     const char *comm = get_task_comm(current);
     unsigned long pc = (unsigned long)regs->pc;
     unsigned long lr = (unsigned long)regs->regs[30];
     int self_protect_reason = classify_self_protect_exit(nr, status, comm, uid, pc, lr);
 
     if (self_protect_reason) {
+        ad_count_event(AD_EVT_EXIT_BYPASS);
         pr_info("anti-detect: bypass self-protect exit nr=%ld status=%ld comm=%s pc=%lx lr=%lx reason=%d\n",
                 nr, status, comm ? comm : "<null>", pc, lr, self_protect_reason);
         args->ret = 0;
@@ -653,8 +1104,8 @@ static void before_exit_syscall(hook_fargs1_t *args, void *udata)
 static void before_kill_syscall(hook_fargs4_t *args, void *udata)
 {
     uid_t uid = current_uid();
-    if (uid < AID_APP_START || should_skip_process(uid))
-        return;
+    int audit_only = 0;
+    if (!ad_should_apply(uid, AD_F_BLOCK_SELF_KILL, &audit_only)) return;
 
     struct pt_regs *regs = NULL;
     long nr = -1;
@@ -675,17 +1126,36 @@ static void before_kill_syscall(hook_fargs4_t *args, void *udata)
         sig = (long)syscall_argn(args, 2);
     }
 
+    /*
+     * Same rule as exit: audit-only records the cheap signal class only. Caller
+     * VMA/path resolution is reserved for the active blocking mode.
+     */
+    if (audit_only) {
+        if (is_fatal_signal(sig))
+            ad_count_event(AD_EVT_KILL_BYPASS);
+        return;
+    }
+
     const char *comm = get_task_comm(current);
     unsigned long pc = (unsigned long)regs->pc;
     unsigned long lr = (unsigned long)regs->regs[30];
     int reason = classify_self_protect_kill(sig, uid, pc, lr);
 
     if (reason) {
+        ad_count_event(AD_EVT_KILL_BYPASS);
         pr_info("anti-detect: bypass self-protect kill nr=%ld target=%ld tid=%ld sig=%ld comm=%s pc=%lx lr=%lx reason=%d\n",
                 nr, target, tid, sig, comm ? comm : "<null>", pc, lr, reason);
         args->ret = 0;
         args->skip_origin = 1;
     }
+}
+
+static void anti_detect_exit_mmap_before(hook_fargs1_t *args, void *udata)
+{
+    void *mm = (void *)args->arg0;
+
+    (void)udata;
+    ad_clear_mm_profiles(mm);
 }
 
 static int resolve_symbols(void)
@@ -723,6 +1193,9 @@ static int resolve_symbols(void)
     kfn_get_task_mm = (typeof(kfn_get_task_mm))kallsyms_lookup_name("get_task_mm");
     kfn_mmput = (typeof(kfn_mmput))kallsyms_lookup_name("mmput");
     kfn_d_path = (typeof(kfn_d_path))kallsyms_lookup_name("d_path");
+    kfn_fget = (typeof(kfn_fget))kallsyms_lookup_name("fget");
+    kfn_fput = (typeof(kfn_fput))kallsyms_lookup_name("fput");
+    kfn_exit_mmap = (void *)kallsyms_lookup_name("exit_mmap");
 
     pr_info("anti-detect: symbols resolved: kmalloc=%px kfree=%px copy_from_user=%px\n",
             kfn_kmalloc, kfn_kfree, kfn_copy_from_user);
@@ -734,6 +1207,14 @@ static int resolve_symbols(void)
                 kfn_copy_from_kernel_nofault, kfn_find_vma, kfn_get_task_mm,
                 kfn_mmput, kfn_d_path);
     }
+    if (!kfn_get_task_mm || !kfn_mmput)
+        pr_warn("anti-detect: per-mm profiles disabled: get_task_mm=%px mmput=%px\n",
+                kfn_get_task_mm, kfn_mmput);
+    if (!kfn_fget || !kfn_fput || !kfn_d_path)
+        pr_warn("anti-detect: fd-aware status filtering disabled: fget=%px fput=%px d_path=%px\n",
+                kfn_fget, kfn_fput, kfn_d_path);
+    if (!kfn_exit_mmap)
+        pr_warn("anti-detect: exit_mmap not found; profile cleanup relies on release/module unload\n");
     return 0;
 }
 
@@ -791,6 +1272,17 @@ static long anti_detect_init(const char *args, const char *event, void *__user r
 
     pr_info("anti-detect: %d hooks installed\n", hooks_installed);
 
+    if (kfn_exit_mmap) {
+        hook_err_t err = hook_wrap1(kfn_exit_mmap, anti_detect_exit_mmap_before, NULL, NULL);
+        if (err == HOOK_NO_ERR) {
+            hooked_exit_mmap = 1;
+            pr_info("anti-detect: hooked exit_mmap %p for profile cleanup\n",
+                    kfn_exit_mmap);
+        } else {
+            pr_warn("anti-detect: failed to hook exit_mmap: %d\n", err);
+        }
+    }
+
     /* args = superkey for supercall guard (optional) */
     if (supercall_guard_init(args))
         goto rollback_supercall;
@@ -799,6 +1291,10 @@ static long anti_detect_init(const char *args, const char *event, void *__user r
 
 rollback_supercall:
     supercall_guard_exit();
+    if (hooked_exit_mmap && kfn_exit_mmap) {
+        hook_unwrap(kfn_exit_mmap, anti_detect_exit_mmap_before, NULL);
+        hooked_exit_mmap = 0;
+    }
 rollback:
     while (hooks_installed-- > 0) {
         const struct syscall_hook *h = &hooks[hooks_installed];
@@ -810,11 +1306,19 @@ rollback:
 static long anti_detect_exit(void *__user reserved)
 {
     supercall_guard_exit();
+    if (hooked_exit_mmap && kfn_exit_mmap) {
+        hook_unwrap(kfn_exit_mmap, anti_detect_exit_mmap_before, NULL);
+        hooked_exit_mmap = 0;
+    }
     int i;
     for (i = NUM_HOOKS; i-- > 0;) {
         const struct syscall_hook *h = &hooks[i];
         unhook_syscalln(h->nr, h->before, h->after);
     }
+    ad_lock_profiles();
+    memset(ad_profiles, 0, sizeof(ad_profiles));
+    ad_profile_count = 0;
+    ad_unlock_profiles();
     pr_info("anti-detect: unloaded\n");
     return 0;
 }

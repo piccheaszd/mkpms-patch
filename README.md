@@ -112,6 +112,14 @@ adb shell su -c '/data/local/tmp/kpatch <superkey> kpm load /data/local/tmp/anti
 adb shell su -c '/data/local/tmp/kpatch <superkey> kpm unload anti-detect'
 ```
 
+若设备侧使用 `kpatch-next` 管理 KPM，可以不带 superkey 直接重载模块；此时 `anti-detect`
+会跳过 supercall guard，其它 syscall/procfs profile 功能仍可用：
+
+```bash
+adb shell su -c '/data/local/tmp/kpatch-next kpm unload anti-detect'
+adb shell su -c '/data/local/tmp/kpatch-next kpm load /data/local/tmp/anti-detect.kpm'
+```
+
 `recompile` 提供 rustFrida `Hook.RECOMP` 的内核侧 ABI。按需加载后，rustFrida 通过
 `prctl(PR_RECOMPILE_REGISTER, 0, orig_page, recomp_page, 0)` 注册原始代码页和重编译页：
 
@@ -188,16 +196,71 @@ adb shell su -c '/data/local/tmp/wxshadow_client --tlb-mode broadcast'
 - 自保护 loader 触发的 `exit` / `kill` 类路径
 - 可选 supercall guard：隐藏错误 superkey 访问
 
+`anti-detect` 1.2.23 起提供 per-mm profile ABI，后续可让目标进程显式注册检测策略。未注册进程仍保留旧的 UID/进程名默认规则；已注册进程优先按 profile flags 处理。1.2.24 起，单独设置 `AD_F_AUDIT_ONLY` 时只注册轻量 profile，不修改 syscall 结果或用户缓冲区；如果同时设置具体检测面 flag，则只统计“本来会被处理”的事件，并在 release / `exit_mmap` 时通过 dmesg 输出计数。`TracerPid` 处理已改为 fd-aware：只有 `fget`/`d_path` 确认 read fd 指向 `/proc/.../status` 时才扫描并过滤，避免误改普通文件内容。
+
+```c
+prctl(0x41440001, 0, flags, profile_id, 0); /* PR_ANTIDETECT_REGISTER */
+prctl(0x41440002, 0, 0, 0, 0);              /* PR_ANTIDETECT_RELEASE */
+```
+
+当前 flags：
+
+- `0x001`：`AD_F_AUDIT_ONLY`
+- `0x002`：路径探测
+- `0x004`：fd/readlink 目标
+- `0x008`：目录枚举
+- `0x010`：`/proc/<pid>/status` / `TracerPid`
+- `0x020`：`ptrace(PTRACE_TRACEME)`
+- `0x040`：`prctl(PR_GET_DUMPABLE)`
+- `0x080`：self-protect `exit`
+- `0x100`：self-protect `kill`
+
+如果 flags 为 `0`，KPM 默认启用全部检测面；只设置 `AD_F_AUDIT_ONLY` 不再自动扩成全检测面，适合作为 BOCHK 等强对抗目标的轻量注册探针。需要 audit-only + 全检测面时显式传 `0x1ff`。profile 绑定调用进程的 `mm`，模块会在 `exit_mmap` 清理。
+
+Android 14 / Linux 6.1.75 设备侧复测记录：`anti-detect` 1.2.23 可通过
+`kpatch-next` 无 superkey 加载；rustFrida BOCHK pure-spawn 在 agent entry 前注册
+audit-only profile 后，KPM 日志显示 `flags=0x1ff`，进程退出时输出
+`path=529 tracerpid=37 dumpable=2092 exit=72 kill=1`。这些是审计计数，不代表
+audit-only 模式实际改写了 syscall 返回值或用户缓冲区。
+
+但该版本会把 `AD_F_AUDIT_ONLY` 自动扩成全检测面，后续 KPM-enabled
+BOCHK `runtime` 复测中出现设备卡死；1.2.24 起改为只有 flags 为 `0`
+时才默认全检测面。
+
+`anti-detect` 1.2.24 + `kpm-hide-maps` 1.1.2 后续 BOCHK 复测记录：rustFrida
+使用 `RF_ANTIDETECT=1` 注册轻量 profile，KPM 日志保持 `flags=0x1`，进程
+退出时 path/link/dir/tracerpid/ptrace/dumpable/exit/kill 计数均为 0。配合
+`RF_SKIP_REPL_READY=1` 跳过 host 侧 post-resume `/proc` 轮询后，BOCHK
+baseline、`runtime`、`resolve`、`read-maps`、`maps-dump`、`bytes-getpid`
+均通过并保持设备响应。
+
+分检测面复测中，`0x11`（status/TracerPid）和 `0x61`
+（ptrace/dumpable）通过；`0x181`（self-exit/self-kill）会在 BOCHK
+恢复后导致设备 adb offline。根因收窄到 exit/kill audit-only 仍调用 active
+self-protect classifier；该 classifier 会在 syscall hook 路径里对 caller
+PC/LR 执行 `find_vma` / `d_path` 模块路径解析。1.2.25 起，exit/kill 的
+audit-only 分支只做轻量状态/信号计数，caller VMA/path 分类只留给 active
+blocking mode；BOCHK UID 快速判断也前置到 caller path lookup 之前。
+实机重载 `anti-detect` 1.2.25 后，`0x181` audit-only 复测 RF 返回 0、
+adb 保持响应；完整重载 `kpm-hide-maps` 1.1.2 后，stage-1 / veneer range
+注册和 `exit_mmap` 清理也正常，`anti-detect` 释放计数为 `exit=3 kill=1`。
+非 audit 的 active blocking 应和 audit-only 分开测试。BOCHK `0x180`
+active exit/kill 复测中，KPM 命中
+`bypass self-protect exit nr=93 status=0 comm=e.process.gapps ... reason=4`，
+RF 返回 0 且 adb 保持响应；但目标随后仍进入 `exit_mmap`，说明该分支没有
+保住 BOCHK 进程生命周期。通用 loader-token active 判断仍可能走 caller
+path 解析，不能按 BOCHK 这条快速路径的结果直接推广。
+
 `hide-maps` 更窄，过滤 `/proc/<pid>/maps` 输出中匹配插桩 token 的行，也支持进程通过 prctl 注册需要隐藏的精确 VMA range。当前默认 token 覆盖 `wwb_`、Frida/rustFrida、`/data/local/tmp/rf`、`/data/local/tmp/rf_`、`/memfd:rust`、`[anon:rust`、LSPosed/Riru/EdXposed/LSPatch/YukiHook/AnyDebug 等常见标识。
 
-`hide-maps` 1.1.1 提供 range ABI，供 rustFrida pure-spawn stage-1 隐藏无名匿名 RX：
+`hide-maps` 1.1.2 提供 range ABI，供 rustFrida pure-spawn stage-1 隐藏无名匿名 RX：
 
 ```c
 prctl(0x484d0001, 0, start, size, 0x1); /* PR_HIDEMAPS_REGISTER, exact range */
 prctl(0x484d0002, 0, start, size, 0);   /* PR_HIDEMAPS_RELEASE */
 ```
 
-KPM 会把 range 绑定到调用进程的 `mm`，只过滤精确匹配的 maps 行，并在 `dup_mmap` fork 路径把 range 传播给 child `mm`。首次命中已注册 range 时会动态校准 `vm_area_struct.vm_mm` 偏移，避免不同 Android 6.1 内核结构布局导致注册成功但 maps 行未隐藏。这个接口只隐藏 `/proc/<pid>/maps` 展示，不会 `munmap`、改页表权限或隐藏 `/proc/<pid>/mem` / `smaps` / `map_files`。
+KPM 会把 range 绑定到调用进程的 `mm`，只过滤精确匹配的 maps 行，并在 `dup_mmap` fork 路径把 range 传播给 child `mm`。首次命中已注册 range 时会动态校准 `vm_area_struct.vm_mm` 偏移，避免不同 Android 6.1 内核结构布局导致注册成功但 maps 行未隐藏。maps 行 token 扫描在 `seq_file` 当前输出缓冲区上做有界匹配，不在 `show_map_vma` 热路径分配临时内存。这个接口只隐藏 `/proc/<pid>/maps` 展示，不会 `munmap`、改页表权限或隐藏 `/proc/<pid>/mem` / `smaps` / `map_files`。BOCHK 复测中，stage-1 RX 和 linker veneer 每次注册 2 个 exact range；首次命中时 `vm_area_struct.vm_mm` offset 从 `0x40` 动态校准到 `0x10`，`exit_mmap` 正常清理 2 个 range。目标自读 `maps-dump` 未再暴露 RF stage-1 / veneer 行。
 
 三者组合时的典型分工：
 

@@ -16,7 +16,7 @@
 #include "../common/kpm_demo_helpers.h"
 
 ///< The name of the module, each KPM must has a unique name.
-KPM_MODULE_INFO("kpm-hide-maps", "1.1.1", "GPL v2", "wwb", "Hide instrumentation helper VMAs from /proc/<pid>/maps");
+KPM_MODULE_INFO("kpm-hide-maps", "1.1.2", "GPL v2", "wwb", "Hide instrumentation helper VMAs from /proc/<pid>/maps");
 
 #ifndef __NR_prctl
 #define __NR_prctl 167
@@ -51,8 +51,6 @@ typedef struct seq_file {
     size_t count;
 } seq_file;
 
-static void *(*vmalloc)(unsigned long size);
-static void (*vfree)(void *point);
 static void *(*get_task_mm)(void *task);
 static void (*mmput)(void *mm);
 static void *show_map_vma;
@@ -425,23 +423,45 @@ static const char * const hidden_map_tokens[] = {
     NULL,
 };
 
-static int line_contains_any(const char *line, const char * const *tokens)
+static int line_contains_token(const char *line, size_t len, const char *token)
+{
+    size_t token_len;
+    size_t i;
+
+    if (!line || !token)
+        return 0;
+
+    token_len = strlen(token);
+    if (!token_len)
+        return 1;
+    if (token_len > len)
+        return 0;
+
+    for (i = 0; i <= len - token_len; i++) {
+        if (line[i] == token[0] && memcmp(line + i, token, token_len) == 0)
+            return 1;
+    }
+
+    return 0;
+}
+
+static int line_contains_any(const char *line, size_t len, const char * const *tokens)
 {
     const char * const *p;
 
     for (p = tokens; *p; p++) {
-        if (strstr(line, *p))
+        if (line_contains_token(line, len, *p))
             return 1;
     }
     return 0;
 }
 
-static int should_hide_maps_line(const char *line)
+static int should_hide_maps_line(const char *line, size_t len)
 {
     if (!line)
         return 0;
 
-    if (line_contains_any(line, hidden_map_tokens))
+    if (line_contains_any(line, len, hidden_map_tokens))
         return 1;
 
     return 0;
@@ -458,9 +478,8 @@ void show_map_vma_after(hook_fargs2_t* args, void * udata){
     size_t start = (size_t)args->local.data0;
     size_t end;
     size_t len;
-    char *line;
 
-    if (!m || !m->buf || !vmalloc || !vfree)
+    if (!m || !m->buf)
         return;
 
     end = m->count;
@@ -473,18 +492,8 @@ void show_map_vma_after(hook_fargs2_t* args, void * udata){
     }
 
     len = end - start;
-    line = vmalloc(len + 1);
-    if (!line)
-        return;
-
-    memcpy(line, m->buf + start, len);
-    line[len] = '\0';
-
-    if (should_hide_maps_line(line)) {
+    if (should_hide_maps_line(m->buf + start, len))
         m->count = start;
-    }
-
-    vfree(line);
 }
 
 static void hide_maps_prctl_before(hook_fargs5_t *args, void *udata)
@@ -560,17 +569,10 @@ static long hide_maps_init(const char *args, const char *event, void *__user res
     (void)reserved;
     kpm_demo_log_init("kpm-hide-maps", event, args);
 
-    vmalloc = (void *)kallsyms_lookup_name("vmalloc");
-    vfree = (void *)kallsyms_lookup_name("vfree");
     get_task_mm = (void *)kallsyms_lookup_name("get_task_mm");
     mmput = (void *)kallsyms_lookup_name("mmput");
     exit_mmap = (void *)kallsyms_lookup_name("exit_mmap");
     dup_mmap = (void *)kallsyms_lookup_name("dup_mmap");
-    if (!vmalloc || !vfree) {
-        pr_err("kpm-hide-maps: vmalloc/vfree not found: vmalloc=%p vfree=%p\n",
-               vmalloc, vfree);
-        return -1;
-    }
     if (!get_task_mm || !mmput) {
         pr_warn("kpm-hide-maps: range prctl disabled: get_task_mm=%px mmput=%px\n",
                 get_task_mm, mmput);
