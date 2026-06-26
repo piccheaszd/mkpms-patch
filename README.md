@@ -1,6 +1,6 @@
 # mkpms
 
-KernelPatch / KPatch-Next KPM 模块工作区，包含 wxshadow、anti-detect、hide-maps、demo 模块，以及少量用户态辅助工具。
+KernelPatch / KPatch-Next KPM 模块工作区，包含 wxshadow、recompile、anti-detect、hide-maps、demo 模块，以及少量用户态辅助工具。
 
 `kernel` 是指向 `.kp/kernel` 的符号链接，来自 `.kp` submodule，主要提供 KernelPatch 头文件、KPM ABI 和编译期参考。
 
@@ -10,6 +10,7 @@ KernelPatch / KPatch-Next KPM 模块工作区，包含 wxshadow、anti-detect、
 | --- | --- |
 | `.kp/` | KernelPatch submodule |
 | `kpms/wxshadow/` | W^X Shadow 隐藏断点 / shadow patch KPM |
+| `kpms/recompile/` | rustFrida `Hook.RECOMP` 使用的代码页重编译 / 执行重定向 KPM |
 | `kpms/anti-detect/` | 隐藏模拟器、KernelPatch、Frida/rustFrida、LSPosed 等检测痕迹的 KPM |
 | `kpms/hide-maps/` | 过滤 `/proc/<pid>/maps` 中的插桩辅助 VMA |
 | `kpms/demo-*` | KernelPatch hello / inline hook / syscall hook 示例 |
@@ -45,6 +46,7 @@ cmake --build build-arm64
 cmake --build build-arm64 --target wxshadow.kpm
 cmake --build build-arm64 --target anti-detect.kpm
 cmake --build build-arm64 --target hide-maps.kpm
+cmake --build build-arm64 --target recompile.kpm
 ```
 
 输出位置：
@@ -53,6 +55,7 @@ cmake --build build-arm64 --target hide-maps.kpm
 build-arm64/kpms/wxshadow/wxshadow.kpm
 build-arm64/kpms/anti-detect/anti-detect.kpm
 build-arm64/kpms/hide-maps/hide-maps.kpm
+build-arm64/kpms/recompile/recompile.kpm
 ```
 
 ### Android 用户态工具
@@ -109,6 +112,18 @@ adb shell su -c '/data/local/tmp/kpatch <superkey> kpm load /data/local/tmp/anti
 adb shell su -c '/data/local/tmp/kpatch <superkey> kpm unload anti-detect'
 ```
 
+`recompile` 提供 rustFrida `Hook.RECOMP` 的内核侧 ABI。按需加载后，rustFrida 通过
+`prctl(PR_RECOMPILE_REGISTER, 0, orig_page, recomp_page, 0)` 注册原始代码页和重编译页：
+
+```bash
+adb push build-arm64/kpms/recompile/recompile.kpm /data/local/tmp/
+adb shell su -c '/data/local/tmp/kpatch <superkey> kpm load /data/local/tmp/recompile.kpm'
+adb shell su -c 'dmesg | grep recompile'
+adb shell su -c '/data/local/tmp/kpatch <superkey> kpm unload recompile'
+```
+
+部分设备上运行期 unload / reload `recompile` 不是可靠测试路径；若 KPatch-Next 管理接口在卸载后异常，优先通过重启或 boot-load 流程复测。
+
 ## wxshadow 快速入口
 
 wxshadow 通过 hook `prctl` 暴露用户态接口，支持隐藏断点、寄存器修改、shadow patch、release 和 TLB flush mode。完整说明见 [kpms/wxshadow/README.md](kpms/wxshadow/README.md)。
@@ -143,17 +158,62 @@ adb shell su -c '/data/local/tmp/wxshadow_client --tlb-mode broadcast'
 - 每个断点最多 4 个寄存器修改。
 - 自读代码页无法同时读取和执行同一 shadow 状态，典型表现是对 CRC/self-check 代码本身下断点可能卡住。
 
-## anti-detect / hide-maps
+## recompile / rustFrida Hook.RECOMP
+
+`recompile.kpm` 用于 rustFrida `Hook.RECOMP`。RF 在用户态复制并改写目标代码页到新的 recompiled page，KPM 在内核侧把原始页改为不可执行；当目标执行原始页触发指令异常时，KPM 将 PC 重定向到对应的 recompiled page。
+
+它主要解决代码页自校验和 inline patch 可见性问题：
+
+- 原始代码页内容保持不变，hook patch 落在 recompiled page / trampoline 上。
+- 注册接口是 `PR_RECOMPILE_REGISTER`，释放接口是 `PR_RECOMPILE_RELEASE`。
+- KPM 会跟踪 per-mm 映射，在 `exit_mmap`、fork / copy process 等路径做清理或修复。
+- 对 signal frame、regset、perf、single-step 等 PC 导出路径做 best-effort 回写，把 recompiled PC 暴露为原始 PC。
+
+关键限制：
+
+- 仅支持 ARM64 代码页级重定向，且原始页、重编译页必须页对齐。
+- 依赖目标内核导出的 kallsyms。缺少 `do_mem_abort` / `do_page_fault`、`exit_mmap` 等关键符号会导致加载失败；缺少 signal、regset、perf、single-step 等可选符号时，只会退化对应的 PC 导出隐藏面。
+- 它不隐藏 agent、socket fd、线程名、`/proc/<pid>/maps` 行或 KernelPatch/KPM 自身痕迹；这些需要和 `hide-maps`、`anti-detect` 以及目标侧专项规则配合。
+
+完整实现和验证说明见 [kpms/recompile/README.md](kpms/recompile/README.md)。
+
+## anti-detect / hide-maps / recompile 职责边界
 
 `anti-detect` 当前用于隐藏常见检测面：
 
 - 文件与路径探测：`stat` / `access` / `readlink` / `getdents64`
-- `/proc` 内容读取中的 Frida/rustFrida/LSPosed 等 token
+- `/proc` 相关路径、fd link、目录项中的 Frida/rustFrida/LSPosed 等 token
+- `/proc/<pid>/status` 等读取结果中的 `TracerPid`
 - `ptrace(PTRACE_TRACEME)`、`prctl(PR_GET_DUMPABLE)` 等部分自检
 - 自保护 loader 触发的 `exit` / `kill` 类路径
 - 可选 supercall guard：隐藏错误 superkey 访问
 
-`hide-maps` 更窄，只过滤 `/proc/<pid>/maps` 输出中匹配插桩 token 的行。两者可按目标检测面分开加载，避免不必要的全局影响。
+`hide-maps` 更窄，过滤 `/proc/<pid>/maps` 输出中匹配插桩 token 的行，也支持进程通过 prctl 注册需要隐藏的精确 VMA range。当前默认 token 覆盖 `wwb_`、Frida/rustFrida、`/data/local/tmp/rf`、`/data/local/tmp/rf_`、`/memfd:rust`、`[anon:rust`、LSPosed/Riru/EdXposed/LSPatch/YukiHook/AnyDebug 等常见标识。
+
+`hide-maps` 1.1.1 提供 range ABI，供 rustFrida pure-spawn stage-1 隐藏无名匿名 RX：
+
+```c
+prctl(0x484d0001, 0, start, size, 0x1); /* PR_HIDEMAPS_REGISTER, exact range */
+prctl(0x484d0002, 0, start, size, 0);   /* PR_HIDEMAPS_RELEASE */
+```
+
+KPM 会把 range 绑定到调用进程的 `mm`，只过滤精确匹配的 maps 行，并在 `dup_mmap` fork 路径把 range 传播给 child `mm`。首次命中已注册 range 时会动态校准 `vm_area_struct.vm_mm` 偏移，避免不同 Android 6.1 内核结构布局导致注册成功但 maps 行未隐藏。这个接口只隐藏 `/proc/<pid>/maps` 展示，不会 `munmap`、改页表权限或隐藏 `/proc/<pid>/mem` / `smaps` / `map_files`。
+
+三者组合时的典型分工：
+
+- `recompile`：隐藏代码页 patch，本身不负责隐藏新增 VMA。
+- `hide-maps`：隐藏 RF agent、recompile/trampoline、WXSHADOW helper 等被命名或路径命中的 maps 行；新版也可隐藏 RF 注册的 stage-1 RX / veneer 精确 range。
+- `anti-detect`：隐藏路径、fd symlink、目录枚举、`TracerPid`、`ptrace(PTRACE_TRACEME)`、`PR_GET_DUMPABLE` 和部分自保护退出路径。
+
+仍需按目标复测的检测面：
+
+- `/proc/self/task/*/comm` 或线程列表：RF/QuickJS 不再使用 `wwb-*` 作为 helper 线程名前缀，但当前 `anti-detect` 仍不做通用线程 comm 过滤。
+- `/proc/self/fd` 和 socket 行为：stream-agent 避免 agent memfd 常驻，但 agent 通信仍需要 socket fd。
+- 未命名匿名 RX VMA：RF agent 段默认命名为 `wwb_so`，会命中 `hide-maps`；pure-spawn stage-1 RX / veneer 由 RF 通过 range ABI 精确注册。其它未命名匿名 RX 不会被全局隐藏，避免误伤 ART/JIT/厂商 runtime。
+- 内核侧可见性：KernelPatch/KPM 列表、supercall 行为、hook 后的内核文本或 ftrace/inline-hook 痕迹不属于用户态 maps 检测面。
+- 时间侧信道和行为侧信号：异常处理频率、hook 回调耗时、线程调度、GC/Java worker 活动仍可能被强对抗目标利用。
+
+按目标检测面分开加载模块，能减少不必要的全局影响和误伤。
 
 ## KPM 开发备注
 
