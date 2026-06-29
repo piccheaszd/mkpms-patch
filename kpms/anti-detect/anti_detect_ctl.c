@@ -20,7 +20,7 @@ static void usage(const char *argv0)
             "Usage:\n"
             "  %s add-uid <uid>\n"
             "  %s add-uid-active <uid>\n"
-            "  %s add-uid-paic <uid>\n"
+            "  %s add-uid-paic <uid>    # PAIC stable: hide + one-shot exit\n"
             "  %s clear-uids\n"
             "  %s mode profile-only|legacy\n",
             argv0, argv0, argv0, argv0, argv0);

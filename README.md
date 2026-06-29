@@ -208,7 +208,7 @@ adb shell su -c '/data/local/tmp/wxshadow_client --tlb-mode broadcast'
 - 自保护 loader 触发的 `exit` / `kill` 类路径
 - 可选 supercall guard：隐藏错误 superkey 访问
 
-`anti-detect` 1.2.23 起提供 per-mm profile ABI，后续可让目标进程显式注册检测策略。已注册进程优先按 profile flags 处理。1.2.24 起，单独设置 `AD_F_AUDIT_ONLY` 时只注册轻量 profile，不修改 syscall 结果或用户缓冲区；如果同时设置具体检测面 flag，则只统计“本来会被处理”的事件，并在 release / `exit_mmap` 时通过 dmesg 输出计数。1.2.26 起默认启用 profile-only strict：未注册进程不再走旧的 UID/进程名 fallback，只有 root 可通过 `PR_ANTIDETECT_SET_MODE` 临时恢复 legacy fallback。`TracerPid` 处理已改为 fd-aware 并带 per-mm fd cache：只有确认 read fd 指向 `/proc/.../status` 时才扫描并过滤，避免误改普通文件内容，也避免每次 read 都重复 `fget` / `d_path`。1.2.31 起保留 profile-only strict，但对 PAIC 进程提供内置兼容：恢复 1.2.25 对 PAIC 有效的完整检测面 flags，并在 `libxloader.so` mmap 后只注册 `LR & 0xffff == 0xe120` 的精确 exit 兼容规则；其它 App 不走该 fallback。
+`anti-detect` 1.2.23 起提供 per-mm profile ABI，后续可让目标进程显式注册检测策略。已注册进程优先按 profile flags 处理。1.2.24 起，单独设置 `AD_F_AUDIT_ONLY` 时只注册轻量 profile，不修改 syscall 结果或用户缓冲区；如果同时设置具体检测面 flag，则只统计“本来会被处理”的事件，并在 release / `exit_mmap` 时通过 dmesg 输出计数。1.2.26 起默认启用 profile-only strict：未注册进程不再走旧的 UID/进程名 fallback，只有 root 可通过 `PR_ANTIDETECT_SET_MODE` 临时恢复 legacy fallback。`TracerPid` 处理已改为 fd-aware 并带 per-mm fd cache：只有确认 read fd 指向 `/proc/.../status` 时才扫描并过滤，避免误改普通文件内容，也避免每次 read 都重复 `fget` / `d_path`。1.2.32 起移除 1.2.31 的 PAIC comm 自动兼容：PAIC 常驻只能通过显式 UID allowlist 启用 `paic-stable`，保持 profile-only strict，不靠线程名自动触发。
 
 ```c
 prctl(0x41440001, 0, flags, profile_id, 0); /* PR_ANTIDETECT_REGISTER */
@@ -229,7 +229,7 @@ anti_detect_ctl clear-uids
 anti_detect_ctl mode profile-only
 ```
 
-`add-uid` 只启用 seed-only；`add-uid-active` 会让 KPM 在命中 loader 可执行映射后自动开启 `AD_F_BLOCK_SELF_EXIT | AD_F_BLOCK_SELF_KILL`，仅用于确认目标不会重试自杀的短时测试。
+`add-uid` 只启用 seed-only；`add-uid-paic` 启用 PAIC 日常常驻 stable 模式：隐藏面常驻，命中 `libxloader.so` 后只注册 `exit + LR low16 == 0xe120 + one-shot` 兜底，不启用 kill blocking；`add-uid-active` 会让 KPM 在命中 loader 可执行映射后自动开启 `AD_F_BLOCK_SELF_EXIT | AD_F_BLOCK_SELF_KILL`，仅用于确认目标不会重试自杀的短时测试，不适合作为 PAIC 日常常驻。
 
 当前 flags：
 
@@ -245,15 +245,16 @@ anti_detect_ctl mode profile-only
 
 如果 flags 为 `0`，KPM 默认启用全部检测面；只设置 `AD_F_AUDIT_ONLY` 不再自动扩成全检测面，适合作为 BOCHK 等强对抗目标的轻量注册探针。需要 audit-only + 全检测面时显式传 `0x1ff`。profile 绑定调用进程的 `mm`，模块会在 `exit_mmap` 清理。
 
-active self-protect 规则也绑定当前注册 profile/mm。1.2.26 起 `exit` / `kill` blocking 不再按通用 caller path token 判断，只匹配预注册 exact range；1.2.31 的常驻 mmap seeding 只提前把命中的 loader 可执行映射注册成 exact range，不恢复旧的全局 caller path fallback。PAIC 的 `libxloader.so` 例外会同时启用完整检测面 flags 和旧版实测过的 `LR & 0xffff == 0xe120` exit 兼容规则，但仍不会恢复 1.2.25 的全局动态 caller path 解析。rule flags 可组合：
+active self-protect 规则也绑定当前注册 profile/mm。1.2.26 起 `exit` / `kill` blocking 不再按通用 caller path token 判断，只匹配预注册 exact range；1.2.31 的 PAIC 内置兼容已废弃。1.2.32 的常驻 mmap seeding 只提前把命中的 loader 可执行映射注册成 exact range，不恢复旧的全局 caller path fallback。PAIC 的 `libxloader.so` 例外必须由 `add-uid-paic <uid>` 显式启用，并只开启隐藏面 + `AD_F_BLOCK_SELF_EXIT`，不启用 `AD_F_BLOCK_SELF_KILL`。注册的 PAIC rule 是 `exit + LR + LR low16 == 0xe120 + one-shot`，命中一次后自动失效，后续异常退出放行，避免 loader 在异常路径里被反复拦截。rule flags 可组合：
 
 - `0x001`：匹配 exit
 - `0x002`：匹配 kill
 - `0x004`：PC 落在 range 内
 - `0x008`：LR 落在 range 内
 - `0x010`：PAIC 兼容规则，仅匹配 `LR & 0xffff == 0xe120`
+- `0x020`：one-shot，命中后自动删除该 rule
 
-rustFrida loader 会在启用 `AD_F_BLOCK_SELF_EXIT` / `AD_F_BLOCK_SELF_KILL` 时注册 stage-1 RX 和 linker veneer range。需要在 rustFrida 启动前保留 loader range（例如 `libxloader.so`）应走 1.2.31 的常驻 mmap seeding 或 UID allowlist；除 PAIC 的精确 LR 兼容分支外，真正启用 active blocking 仍应由 RF profile 或显式 `add-uid-active` 控制。没有注册 exact range 的 App 即使打开了 active flags，也不会因为旧的 loader-token 规则被误拦截。
+rustFrida loader 会在启用 `AD_F_BLOCK_SELF_EXIT` / `AD_F_BLOCK_SELF_KILL` 时注册 stage-1 RX 和 linker veneer range。需要在 rustFrida 启动前保留 loader range（例如 PAIC `libxloader.so`）应走 UID allowlist；PAIC 日常只使用 `add-uid-paic`，不要使用 `mode legacy` 或 `add-uid-active`。除 PAIC 的 one-shot LR 兼容分支外，真正启用 active blocking 仍应由 RF profile 或显式 `add-uid-active` 控制。没有注册 exact range 的 App 即使打开了 active flags，也不会因为旧的 loader-token 规则被误拦截。
 
 Android 14 / Linux 6.1.75 设备侧复测记录：`anti-detect` 1.2.23 可通过
 `kpatch-next` 无 superkey 加载；rustFrida BOCHK pure-spawn 在 agent entry 前注册
@@ -288,7 +289,7 @@ active exit/kill 复测中，KPM 命中
 RF 返回 0 且 adb 保持响应；但目标随后仍进入 `exit_mmap`，说明该分支没有
 保住 BOCHK 进程生命周期。1.2.26 后 active blocking 已改为预注册 exact range，不再走通用 caller path token；仍需单独复测它是否能保住 BOCHK 生命周期，因为“不会卡死”和“阻断目标自杀”是两件事。
 
-1.2.27 曾在 mmap seeding 命中后自动开启 active `exit` / `kill` blocking。PAIC 这类 loader 如果在检测到异常后反复调用 `exit_group()`，KPM 伪造返回会让它停留在异常路径并可能触发 CPU / dmesg 风暴。1.2.28 将默认行为改为 seed-only，但这会让 PAIC 重新执行 `libxloader.so` 的 `exit_group(0)` 而打不开。1.2.29 给 PAIC + `libxloader.so` 恢复 exit-only active range 后仍可能卡死，因为它会吞掉整段 loader 发起的 exit。1.2.30 改为只匹配 1.2.25 中 PAIC 实测过的 `LR & 0xffff == 0xe120` 分支，但只启用了 self-exit flags，缺少 1.2.25 同时生效的路径、fd、目录、TracerPid、ptrace、dumpable 等隐藏面。1.2.31 将 PAIC 内置兼容改为完整检测面 flags + 精确 LR exit 规则，其它 App 仍保持 profile-only strict。
+1.2.27 曾在 mmap seeding 命中后自动开启 active `exit` / `kill` blocking。PAIC 这类 loader 如果在检测到异常后反复调用 `exit_group()`，KPM 伪造返回会让它停留在异常路径并可能触发 CPU / dmesg 风暴。1.2.28 将默认行为改为 seed-only，但这会让 PAIC 重新执行 `libxloader.so` 的 `exit_group(0)` 而打不开。1.2.29 给 PAIC + `libxloader.so` 恢复 exit-only active range 后仍可能卡死，因为它会吞掉整段 loader 发起的 exit。1.2.30 改为只匹配 1.2.25 中 PAIC 实测过的 `LR & 0xffff == 0xe120` 分支，但只启用了 self-exit flags，缺少 1.2.25 同时生效的路径、fd、目录、TracerPid、ptrace、dumpable 等隐藏面。1.2.31 将 PAIC 内置兼容改为完整检测面 flags + 精确 LR exit 规则，仍会让 PAIC comm 绕过 profile-only strict。1.2.32 改为 `paic-stable`：必须显式 `add-uid-paic <PAIC_UID>`，启用隐藏面 + exit-only one-shot LR rule，不启用 kill，不靠 comm 自动触发，不走 legacy fallback。验收目标是 PAIC 打开后最多出现一次 exit bypass，release profile 时 `exit <= 1, kill = 0`，adb/top/dmesg 保持稳定。
 
 `hide-maps` 更窄，过滤 `/proc/<pid>/maps` 输出中匹配插桩 token 的行，也支持进程通过 prctl 注册需要隐藏的精确 VMA range。当前默认 token 覆盖 `wwb_`、Frida/rustFrida、`/data/local/tmp/rf`、`/data/local/tmp/rf_`、`/memfd:rust`、`[anon:rust`、LSPosed/Riru/EdXposed/LSPatch/YukiHook/AnyDebug 等常见标识。
 

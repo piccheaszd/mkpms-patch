@@ -23,7 +23,7 @@
 #include "../common/kpm_demo_helpers.h"
 
 KPM_MODULE_INFO("anti-detect",
-                "1.2.31",
+                "1.2.32",
                 "GPL v2",
                 "wwb",
                 "Hide emulator, KernelPatch, and instrumentation artifacts from apps");
@@ -108,15 +108,19 @@ static void *kfn_exit_mmap;
                                AD_F_GUARD_PTRACE | AD_F_GUARD_DUMPABLE | \
                                AD_F_BLOCK_SELF_EXIT | AD_F_BLOCK_SELF_KILL)
 #define AD_F_ALLOWED_MASK     (AD_F_AUDIT_ONLY | AD_F_FEATURE_MASK)
-#define AD_PAIC_COMPAT_FLAGS  AD_F_FEATURE_MASK
+#define AD_PAIC_HIDE_FLAGS    (AD_F_HIDE_PATHS | AD_F_HIDE_LINKS | \
+                               AD_F_FILTER_DIRS | AD_F_FILTER_STATUS | \
+                               AD_F_GUARD_PTRACE | AD_F_GUARD_DUMPABLE)
+#define AD_PAIC_STABLE_FLAGS  (AD_PAIC_HIDE_FLAGS | AD_F_BLOCK_SELF_EXIT)
 
 #define AD_RULE_EXIT          (1UL << 0)
 #define AD_RULE_KILL          (1UL << 1)
 #define AD_RULE_PC            (1UL << 2)
 #define AD_RULE_LR            (1UL << 3)
 #define AD_RULE_PAIC_LR_E120  (1UL << 4)
+#define AD_RULE_ONESHOT       (1UL << 5)
 #define AD_RULE_DEFAULT       (AD_RULE_EXIT | AD_RULE_KILL | AD_RULE_PC | AD_RULE_LR)
-#define AD_RULE_ALLOWED_MASK  (AD_RULE_DEFAULT | AD_RULE_PAIC_LR_E120)
+#define AD_RULE_ALLOWED_MASK  (AD_RULE_DEFAULT | AD_RULE_PAIC_LR_E120 | AD_RULE_ONESHOT)
 
 enum anti_detect_event {
     AD_EVT_PATH_HIT,
@@ -243,8 +247,6 @@ static const char * const hidden_link_tokens[] = {
 static const char * const persistent_self_protect_process_tokens[] = {
     "bochk.app.aos",
     "com.bochk",
-    "paic.mo",
-    "com.paic",
     NULL,
 };
 
@@ -266,6 +268,8 @@ static int ad_profile_only_mode = 1;
 
 static int should_skip_process(uid_t uid);
 static int current_comm_matches_paic_target(void);
+static int current_paic_compat_enabled(uid_t uid);
+static int persistent_uid_allowed(uid_t uid, unsigned long *flags);
 static int is_err_ptr(const void *ptr);
 static int looks_like_kernel_ptr(const void *ptr);
 
@@ -586,35 +590,6 @@ static unsigned long ad_current_event_count(enum anti_detect_event event)
     return count;
 }
 
-static int ad_copy_current_profile(struct anti_detect_profile *out)
-{
-    void *mm;
-    int found = 0;
-    int i;
-
-    if (!out || ad_profile_count <= 0 || !kfn_get_task_mm || !kfn_mmput)
-        return 0;
-
-    memset(out, 0, sizeof(*out));
-    mm = kfn_get_task_mm(current);
-    if (!mm)
-        return 0;
-
-    ad_lock_profiles();
-    for (i = 0; i < AD_MAX_PROFILES; i++) {
-        struct anti_detect_profile *p = &ad_profiles[i];
-        if (!p->active || p->mm != mm)
-            continue;
-        ad_copy_profile(out, p);
-        found = 1;
-        break;
-    }
-    ad_unlock_profiles();
-
-    kfn_mmput(mm);
-    return found;
-}
-
 static int ad_fd_cache_lookup(long fd, int *is_proc_status)
 {
     void *mm;
@@ -721,14 +696,14 @@ static void ad_fd_cache_clear(long fd)
 static int ad_should_apply(uid_t uid, unsigned long feature, int *audit_only)
 {
     unsigned long flags = 0;
-    int paic_compat = current_comm_matches_paic_target();
+    int paic_compat = current_paic_compat_enabled(uid);
 
     if (audit_only)
         *audit_only = 0;
 
     if (ad_current_profile_flags(&flags)) {
         if ((flags & feature) == 0) {
-            if (paic_compat && (AD_PAIC_COMPAT_FLAGS & feature))
+            if (paic_compat && (AD_PAIC_STABLE_FLAGS & feature))
                 return 1;
             return 0;
         }
@@ -737,7 +712,7 @@ static int ad_should_apply(uid_t uid, unsigned long feature, int *audit_only)
         return 1;
     }
 
-    if (paic_compat && (AD_PAIC_COMPAT_FLAGS & feature))
+    if (paic_compat && (AD_PAIC_STABLE_FLAGS & feature))
         return 1;
 
     if (ad_profile_only_mode)
@@ -999,6 +974,18 @@ static int persistent_uid_allowed(uid_t uid, unsigned long *flags)
     }
     ad_unlock_profiles();
     return allowed;
+}
+
+static int current_paic_compat_enabled(uid_t uid)
+{
+    unsigned long persistent_flags = 0;
+
+    if (!current_comm_matches_paic_target())
+        return 0;
+    if (!persistent_uid_allowed(uid, &persistent_flags))
+        return 0;
+
+    return (persistent_flags & AD_PERSISTENT_UID_PAIC_COMPAT) != 0;
 }
 
 static int current_is_persistent_self_protect_target(uid_t uid,
@@ -1547,13 +1534,16 @@ static void after_mmap_syscall(hook_fargs6_t *args, void *udata)
         return;
 
     paic_compat = matched && strstr(matched, "libxloader.so") &&
-                  (current_comm_matches_paic_target() ||
-                   (persistent_flags & AD_PERSISTENT_UID_PAIC_COMPAT));
+                  current_paic_compat_enabled(uid);
     if (paic_compat) {
-        profile_flags = AD_PAIC_COMPAT_FLAGS;
-        rule_flags = AD_RULE_PAIC_LR_E120 | AD_RULE_LR;
+        profile_flags = AD_PAIC_STABLE_FLAGS;
+        rule_flags = AD_RULE_EXIT | AD_RULE_LR |
+                     AD_RULE_PAIC_LR_E120 | AD_RULE_ONESHOT;
     } else if (persistent_flags & AD_PERSISTENT_UID_ACTIVE) {
         profile_flags = AD_F_BLOCK_SELF_EXIT | AD_F_BLOCK_SELF_KILL;
+    } else if (persistent_flags & AD_PERSISTENT_UID_PAIC_COMPAT) {
+        kfn_mmput(mm);
+        return;
     }
 
     ret = ad_ensure_profile_flags(mm, profile_flags, AD_PERSISTENT_PROFILE_ID);
@@ -1581,53 +1571,68 @@ static int addr_in_self_protect_rule(unsigned long addr,
            addr >= rule->start && addr < rule->end;
 }
 
-static int current_profile_matches_self_protect_rule(unsigned long want,
-                                                     unsigned long pc,
-                                                     unsigned long lr)
+static int self_protect_rule_matches(unsigned long want,
+                                     unsigned long pc,
+                                     unsigned long lr,
+                                     const struct anti_detect_self_protect_rule *rule)
 {
-    struct anti_detect_profile profile;
-    int i;
-
-    if (!ad_copy_current_profile(&profile))
+    if (!rule || !rule->active || (rule->flags & want) == 0)
         return 0;
 
-    for (i = 0; i < AD_MAX_SELF_PROTECT_RULES; i++) {
-        const struct anti_detect_self_protect_rule *r =
-            &profile.self_protect_rules[i];
-        if (!r->active || (r->flags & want) == 0)
-            continue;
-        if ((r->flags & AD_RULE_PC) && addr_in_self_protect_rule(pc, r))
-            return 1;
-        if ((r->flags & AD_RULE_LR) && addr_in_self_protect_rule(lr, r))
-            return 1;
-    }
+    if ((rule->flags & AD_RULE_PAIC_LR_E120) &&
+        ((lr & 0xffffUL) != AD_PAIC_COMPAT_LR_LOW16))
+        return 0;
+
+    if ((rule->flags & AD_RULE_PC) && addr_in_self_protect_rule(pc, rule))
+        return 1;
+    if ((rule->flags & AD_RULE_LR) && addr_in_self_protect_rule(lr, rule))
+        return 1;
 
     return 0;
 }
 
-static int current_profile_matches_paic_lr_rule(unsigned long pc,
-                                                unsigned long lr)
+static int ad_consume_self_protect_rule(unsigned long want,
+                                        unsigned long pc,
+                                        unsigned long lr)
 {
-    struct anti_detect_profile profile;
-    int i;
+    void *mm;
+    int matched = 0;
+    int i, j;
 
-    if ((lr & 0xffffUL) != AD_PAIC_COMPAT_LR_LOW16)
-        return 0;
-    if (!ad_copy_current_profile(&profile))
+    if (!kfn_get_task_mm || !kfn_mmput)
         return 0;
 
-    for (i = 0; i < AD_MAX_SELF_PROTECT_RULES; i++) {
-        const struct anti_detect_self_protect_rule *r =
-            &profile.self_protect_rules[i];
-        if (!r->active || (r->flags & AD_RULE_PAIC_LR_E120) == 0)
+    mm = kfn_get_task_mm(current);
+    if (!mm)
+        return 0;
+
+    ad_lock_profiles();
+    for (i = 0; i < AD_MAX_PROFILES && !matched; i++) {
+        struct anti_detect_profile *p = &ad_profiles[i];
+
+        if (!p->active || p->mm != mm)
             continue;
-        if ((r->flags & AD_RULE_LR) && addr_in_self_protect_rule(lr, r))
-            return 1;
-        if ((r->flags & AD_RULE_PC) && addr_in_self_protect_rule(pc, r))
-            return 1;
-    }
 
-    return 0;
+        for (j = 0; j < AD_MAX_SELF_PROTECT_RULES; j++) {
+            struct anti_detect_self_protect_rule *r =
+                &p->self_protect_rules[j];
+
+            if (!self_protect_rule_matches(want, pc, lr, r))
+                continue;
+
+            matched = 1;
+            if (r->flags & AD_RULE_ONESHOT) {
+                memset(r, 0, sizeof(*r));
+                if (p->self_protect_rule_count > 0)
+                    p->self_protect_rule_count--;
+            }
+            break;
+        }
+    }
+    ad_unlock_profiles();
+
+    kfn_mmput(mm);
+    return matched;
 }
 
 static int classify_self_protect_exit(long nr, long status, const char *comm,
@@ -1640,11 +1645,11 @@ static int classify_self_protect_exit(long nr, long status, const char *comm,
         return 0;
 
     if (status == 0 && comm && strstr(comm, "mo.client") &&
-        current_profile_matches_paic_lr_rule(pc, lr))
+        ad_consume_self_protect_rule(AD_RULE_EXIT, pc, lr))
         return 2;
 
     if (is_self_protect_exit_status(status) &&
-        current_profile_matches_self_protect_rule(AD_RULE_EXIT, pc, lr))
+        ad_consume_self_protect_rule(AD_RULE_EXIT, pc, lr))
         return 1;
 
     return 0;
@@ -1664,7 +1669,7 @@ static int classify_self_protect_kill(long sig, uid_t uid,
     if (!is_fatal_signal(sig))
         return 0;
 
-    if (current_profile_matches_self_protect_rule(AD_RULE_KILL, pc, lr))
+    if (ad_consume_self_protect_rule(AD_RULE_KILL, pc, lr))
         return 3;
 
     return 0;
