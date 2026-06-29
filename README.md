@@ -91,7 +91,9 @@ cd java-hide-lsposed
 
 ## 部署
 
-以下命令需要已授权测试设备、root 权限和 KernelPatch / KPatch-Next superkey。
+以下命令需要已授权测试设备和 root 权限。旧 KernelPatch CLI 需要 superkey；设备侧若使用
+KPatch-Next 模块自带的 `kpatch` / `kpatch-next` CLI，则 KPM 管理命令可以不带
+superkey。
 
 ```bash
 adb push build-arm64/kpms/wxshadow/wxshadow.kpm /data/local/tmp/
@@ -113,7 +115,17 @@ adb shell su -c '/data/local/tmp/kpatch <superkey> kpm unload anti-detect'
 ```
 
 若设备侧使用 `kpatch-next` 管理 KPM，可以不带 superkey 直接重载模块；此时 `anti-detect`
-会跳过 supercall guard，其它 syscall/procfs profile 功能仍可用：
+会跳过 supercall guard，其它 syscall/procfs profile 功能仍可用。可先确认临时 CLI
+确实来自 KPatch-Next 模块：
+
+```bash
+adb shell "su -c 'sha256sum /data/local/tmp/kpatch-next /data/adb/modules/KPatch-Next/bin/kpatch'"
+adb shell "su -c '/data/local/tmp/kpatch-next kpm info anti-detect'"
+```
+
+`kpatch-next kpm load/unload/info` 只负责 KPM 管理；rustFrida 运行时的
+`hide-maps` range 注册、`recompile` mapping 注册和 `anti-detect` profile 注册通过
+已加载 KPM 暴露的 `prctl` ABI 完成，不会每次 hook 都调用 KPatch-Next CLI。
 
 ```bash
 adb shell su -c '/data/local/tmp/kpatch-next kpm unload anti-detect'
@@ -130,7 +142,7 @@ adb shell su -c 'dmesg | grep recompile'
 adb shell su -c '/data/local/tmp/kpatch <superkey> kpm unload recompile'
 ```
 
-部分设备上运行期 unload / reload `recompile` 不是可靠测试路径；若 KPatch-Next 管理接口在卸载后异常，优先通过重启或 boot-load 流程复测。
+部分设备上运行期 unload / reload KPM 不是可靠测试路径；若 KPatch-Next 管理接口在卸载后异常，优先通过重启或 boot-load 流程复测。当前 Android 14 / Linux 6.1.75 BOCHK 测试机上，热卸载 `anti-detect` 后曾出现管理 supercall 状态异常，后续热加载新旧 KPM 都不可靠；更新 `anti-detect` 这类常驻 syscall hook 模块时，优先把验证过的 `.kpm` 放入 `/data/adb/kp-next/kpm/` 持久目录后重启验证，而不是在目标测试前反复 hot unload/load。
 
 ## wxshadow 快速入口
 
@@ -196,11 +208,13 @@ adb shell su -c '/data/local/tmp/wxshadow_client --tlb-mode broadcast'
 - 自保护 loader 触发的 `exit` / `kill` 类路径
 - 可选 supercall guard：隐藏错误 superkey 访问
 
-`anti-detect` 1.2.23 起提供 per-mm profile ABI，后续可让目标进程显式注册检测策略。未注册进程仍保留旧的 UID/进程名默认规则；已注册进程优先按 profile flags 处理。1.2.24 起，单独设置 `AD_F_AUDIT_ONLY` 时只注册轻量 profile，不修改 syscall 结果或用户缓冲区；如果同时设置具体检测面 flag，则只统计“本来会被处理”的事件，并在 release / `exit_mmap` 时通过 dmesg 输出计数。`TracerPid` 处理已改为 fd-aware：只有 `fget`/`d_path` 确认 read fd 指向 `/proc/.../status` 时才扫描并过滤，避免误改普通文件内容。
+`anti-detect` 1.2.23 起提供 per-mm profile ABI，后续可让目标进程显式注册检测策略。已注册进程优先按 profile flags 处理。1.2.24 起，单独设置 `AD_F_AUDIT_ONLY` 时只注册轻量 profile，不修改 syscall 结果或用户缓冲区；如果同时设置具体检测面 flag，则只统计“本来会被处理”的事件，并在 release / `exit_mmap` 时通过 dmesg 输出计数。1.2.26 起默认启用 profile-only strict：未注册进程不再走旧的 UID/进程名 fallback，只有 root 可通过 `PR_ANTIDETECT_SET_MODE` 临时恢复 legacy fallback。`TracerPid` 处理已改为 fd-aware 并带 per-mm fd cache：只有确认 read fd 指向 `/proc/.../status` 时才扫描并过滤，避免误改普通文件内容，也避免每次 read 都重复 `fget` / `d_path`。
 
 ```c
 prctl(0x41440001, 0, flags, profile_id, 0); /* PR_ANTIDETECT_REGISTER */
 prctl(0x41440002, 0, 0, 0, 0);              /* PR_ANTIDETECT_RELEASE */
+prctl(0x41440003, 0, mode, 0, 0);           /* PR_ANTIDETECT_SET_MODE; root only */
+prctl(0x41440004, 0, start, size, rule);    /* PR_ANTIDETECT_ADD_SELF_PROTECT_RULE */
 ```
 
 当前 flags：
@@ -216,6 +230,15 @@ prctl(0x41440002, 0, 0, 0, 0);              /* PR_ANTIDETECT_RELEASE */
 - `0x100`：self-protect `kill`
 
 如果 flags 为 `0`，KPM 默认启用全部检测面；只设置 `AD_F_AUDIT_ONLY` 不再自动扩成全检测面，适合作为 BOCHK 等强对抗目标的轻量注册探针。需要 audit-only + 全检测面时显式传 `0x1ff`。profile 绑定调用进程的 `mm`，模块会在 `exit_mmap` 清理。
+
+active self-protect 规则也绑定当前注册 profile/mm。1.2.26 起 `exit` / `kill` blocking 不再按通用 caller path token 判断，只匹配预注册 exact range；rule flags 可组合：
+
+- `0x001`：匹配 exit
+- `0x002`：匹配 kill
+- `0x004`：PC 落在 range 内
+- `0x008`：LR 落在 range 内
+
+rustFrida loader 会在启用 `AD_F_BLOCK_SELF_EXIT` / `AD_F_BLOCK_SELF_KILL` 时注册 stage-1 RX 和 linker veneer range。没有注册 exact range 的 App 即使打开了 active flags，也不会因为旧的 loader-token 规则被误拦截。
 
 Android 14 / Linux 6.1.75 设备侧复测记录：`anti-detect` 1.2.23 可通过
 `kpatch-next` 无 superkey 加载；rustFrida BOCHK pure-spawn 在 agent entry 前注册
@@ -239,8 +262,8 @@ baseline、`runtime`、`resolve`、`read-maps`、`maps-dump`、`bytes-getpid`
 恢复后导致设备 adb offline。根因收窄到 exit/kill audit-only 仍调用 active
 self-protect classifier；该 classifier 会在 syscall hook 路径里对 caller
 PC/LR 执行 `find_vma` / `d_path` 模块路径解析。1.2.25 起，exit/kill 的
-audit-only 分支只做轻量状态/信号计数，caller VMA/path 分类只留给 active
-blocking mode；BOCHK UID 快速判断也前置到 caller path lookup 之前。
+audit-only 分支只做轻量状态/信号计数；1.2.26 起 active blocking 也改为
+预注册 exact range，不再做 caller VMA/path 分类。
 实机重载 `anti-detect` 1.2.25 后，`0x181` audit-only 复测 RF 返回 0、
 adb 保持响应；完整重载 `kpm-hide-maps` 1.1.2 后，stage-1 / veneer range
 注册和 `exit_mmap` 清理也正常，`anti-detect` 释放计数为 `exit=3 kill=1`。
@@ -248,8 +271,7 @@ adb 保持响应；完整重载 `kpm-hide-maps` 1.1.2 后，stage-1 / veneer ran
 active exit/kill 复测中，KPM 命中
 `bypass self-protect exit nr=93 status=0 comm=e.process.gapps ... reason=4`，
 RF 返回 0 且 adb 保持响应；但目标随后仍进入 `exit_mmap`，说明该分支没有
-保住 BOCHK 进程生命周期。通用 loader-token active 判断仍可能走 caller
-path 解析，不能按 BOCHK 这条快速路径的结果直接推广。
+保住 BOCHK 进程生命周期。1.2.26 后 active blocking 已改为预注册 exact range，不再走通用 caller path token；仍需单独复测它是否能保住 BOCHK 生命周期，因为“不会卡死”和“阻断目标自杀”是两件事。
 
 `hide-maps` 更窄，过滤 `/proc/<pid>/maps` 输出中匹配插桩 token 的行，也支持进程通过 prctl 注册需要隐藏的精确 VMA range。当前默认 token 覆盖 `wwb_`、Frida/rustFrida、`/data/local/tmp/rf`、`/data/local/tmp/rf_`、`/memfd:rust`、`[anon:rust`、LSPosed/Riru/EdXposed/LSPatch/YukiHook/AnyDebug 等常见标识。
 
