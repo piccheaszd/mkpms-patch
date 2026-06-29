@@ -13,6 +13,8 @@
 #define AD_MODE_PROFILE_ONLY (1UL << 0)
 #define AD_PERSISTENT_UID_ACTIVE (1UL << 0)
 #define AD_PERSISTENT_UID_PAIC_COMPAT (1UL << 1)
+#define AD_PERSISTENT_UID_PAIC_FULL (1UL << 2)
+#define AD_PERSISTENT_UID_PAIC_HIDE_ONLY (1UL << 3)
 
 static void usage(const char *argv0)
 {
@@ -20,10 +22,12 @@ static void usage(const char *argv0)
             "Usage:\n"
             "  %s add-uid <uid>\n"
             "  %s add-uid-active <uid>\n"
-            "  %s add-uid-paic <uid>    # PAIC stable: hide + one-shot exit\n"
+            "  %s add-uid-paic <uid>       # PAIC daily: light hide + one-shot exit\n"
+            "  %s add-uid-paic-full <uid>  # PAIC debug: full hide + one-shot exit\n"
+            "  %s add-uid-paic-hide <uid>  # PAIC probe: light hide only\n"
             "  %s clear-uids\n"
             "  %s mode profile-only|legacy\n",
-            argv0, argv0, argv0, argv0, argv0);
+            argv0, argv0, argv0, argv0, argv0, argv0, argv0);
 }
 
 static int parse_ulong(const char *value, unsigned long *out)
@@ -95,6 +99,26 @@ int main(int argc, char **argv)
         }
         return run_prctl2(PR_ANTIDETECT_ADD_PERSISTENT_UID, value,
                           AD_PERSISTENT_UID_PAIC_COMPAT);
+    }
+
+    if (!strcmp(argv[1], "add-uid-paic-full")) {
+        if (argc != 3 || parse_ulong(argv[2], &value) != 0) {
+            usage(argv[0]);
+            return 2;
+        }
+        return run_prctl2(PR_ANTIDETECT_ADD_PERSISTENT_UID, value,
+                          AD_PERSISTENT_UID_PAIC_COMPAT |
+                          AD_PERSISTENT_UID_PAIC_FULL);
+    }
+
+    if (!strcmp(argv[1], "add-uid-paic-hide")) {
+        if (argc != 3 || parse_ulong(argv[2], &value) != 0) {
+            usage(argv[0]);
+            return 2;
+        }
+        return run_prctl2(PR_ANTIDETECT_ADD_PERSISTENT_UID, value,
+                          AD_PERSISTENT_UID_PAIC_COMPAT |
+                          AD_PERSISTENT_UID_PAIC_HIDE_ONLY);
     }
 
     if (!strcmp(argv[1], "clear-uids")) {
