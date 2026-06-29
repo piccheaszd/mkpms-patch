@@ -23,7 +23,7 @@
 #include "../common/kpm_demo_helpers.h"
 
 KPM_MODULE_INFO("anti-detect",
-                "1.2.36",
+                "1.2.37",
                 "GPL v2",
                 "wwb",
                 "Hide emulator, KernelPatch, and instrumentation artifacts from apps");
@@ -303,6 +303,11 @@ static unsigned long ad_normalize_flags(unsigned long flags)
     return flags;
 }
 
+static int ad_has_feature_flags(unsigned long flags)
+{
+    return (flags & AD_F_FEATURE_MASK) != 0;
+}
+
 static void ad_log_profile_stats(const char *prefix,
                                  const struct anti_detect_profile *profile)
 {
@@ -388,9 +393,13 @@ static int ad_register_profile(void *mm, unsigned long flags,
             continue;
         }
         if (p->mm == mm) {
-            if (!p->flags && flags)
+            int old_has_features = ad_has_feature_flags(p->flags);
+            int new_has_features = ad_has_feature_flags(flags);
+
+            if (!old_has_features && new_has_features)
                 ad_feature_profile_count++;
-            else if (p->flags && !flags && ad_feature_profile_count > 0)
+            else if (old_has_features && !new_has_features &&
+                     ad_feature_profile_count > 0)
                 ad_feature_profile_count--;
             p->flags = flags;
             p->profile_id = profile_id;
@@ -413,7 +422,7 @@ static int ad_register_profile(void *mm, unsigned long flags,
     ad_profiles[free_slot].flags = flags;
     ad_profiles[free_slot].profile_id = profile_id;
     ad_profile_count++;
-    if (flags)
+    if (ad_has_feature_flags(flags))
         ad_feature_profile_count++;
     ad_unlock_profiles();
 
@@ -443,9 +452,10 @@ static int ad_ensure_profile_flags(void *mm, unsigned long flags,
         }
         if (p->mm == mm) {
             unsigned long old_flags = p->flags;
+            int old_has_features = ad_has_feature_flags(old_flags);
 
             p->flags |= flags;
-            if (!old_flags && p->flags)
+            if (!old_has_features && ad_has_feature_flags(p->flags))
                 ad_feature_profile_count++;
             if (!p->profile_id)
                 p->profile_id = profile_id;
@@ -465,7 +475,7 @@ static int ad_ensure_profile_flags(void *mm, unsigned long flags,
     ad_profiles[free_slot].flags = flags;
     ad_profiles[free_slot].profile_id = profile_id;
     ad_profile_count++;
-    if (flags)
+    if (ad_has_feature_flags(flags))
         ad_feature_profile_count++;
     ad_unlock_profiles();
 
@@ -492,7 +502,8 @@ static int ad_release_profile(void *mm)
             continue;
 
         ad_copy_profile(&released, p);
-        if (p->flags && ad_feature_profile_count > 0)
+        if (ad_has_feature_flags(p->flags) &&
+            ad_feature_profile_count > 0)
             ad_feature_profile_count--;
         ad_fd_cache_entry_count -= ad_profile_fd_cache_count(p);
         if (ad_fd_cache_entry_count < 0)
@@ -530,7 +541,8 @@ static int ad_clear_mm_profiles(void *mm)
             continue;
 
         ad_copy_profile(&released, p);
-        if (p->flags && ad_feature_profile_count > 0)
+        if (ad_has_feature_flags(p->flags) &&
+            ad_feature_profile_count > 0)
             ad_feature_profile_count--;
         ad_fd_cache_entry_count -= ad_profile_fd_cache_count(p);
         if (ad_fd_cache_entry_count < 0)
