@@ -23,7 +23,7 @@
 #include "../common/kpm_demo_helpers.h"
 
 KPM_MODULE_INFO("anti-detect",
-                "1.2.32",
+                "1.2.33",
                 "GPL v2",
                 "wwb",
                 "Hide emulator, KernelPatch, and instrumentation artifacts from apps");
@@ -267,7 +267,6 @@ static int hooked_exit_mmap;
 static int ad_profile_only_mode = 1;
 
 static int should_skip_process(uid_t uid);
-static int current_comm_matches_paic_target(void);
 static int current_paic_compat_enabled(uid_t uid);
 static int persistent_uid_allowed(uid_t uid, unsigned long *flags);
 static int is_err_ptr(const void *ptr);
@@ -948,13 +947,6 @@ static int current_comm_matches_persistent_target(void)
     return 0;
 }
 
-static int current_comm_matches_paic_target(void)
-{
-    return task_comm_contains(current, "paic.mo") ||
-           task_comm_contains(current, "com.paic") ||
-           task_comm_contains(current, "mo.client");
-}
-
 static int persistent_uid_allowed(uid_t uid, unsigned long *flags)
 {
     int allowed = 0;
@@ -980,8 +972,12 @@ static int current_paic_compat_enabled(uid_t uid)
 {
     unsigned long persistent_flags = 0;
 
-    if (!current_comm_matches_paic_target())
-        return 0;
+    /*
+     * PAIC stable is keyed by explicit UID only. Individual PAIC threads can
+     * run with loader/Binder/JIT comm values, so per-thread comm matching would
+     * drop the hide surface and libxloader one-shot rule on the paths that need
+     * them most.
+     */
     if (!persistent_uid_allowed(uid, &persistent_flags))
         return 0;
 
