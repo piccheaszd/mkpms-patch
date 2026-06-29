@@ -23,7 +23,7 @@
 #include "../common/kpm_demo_helpers.h"
 
 KPM_MODULE_INFO("anti-detect",
-                "1.2.35",
+                "1.2.36",
                 "GPL v2",
                 "wwb",
                 "Hide emulator, KernelPatch, and instrumentation artifacts from apps");
@@ -275,6 +275,7 @@ static int ad_profile_only_mode = 1;
 
 static int should_skip_process(uid_t uid);
 static unsigned long current_paic_feature_flags(uid_t uid);
+static int persistent_uid_maybe_allowed(uid_t uid);
 static int persistent_uid_allowed(uid_t uid, unsigned long *flags);
 static int is_err_ptr(const void *ptr);
 static int looks_like_kernel_ptr(const void *ptr);
@@ -747,13 +748,16 @@ static void ad_fd_cache_clear(long fd)
 static int ad_should_apply(uid_t uid, unsigned long feature, int *audit_only)
 {
     unsigned long flags = 0;
-    unsigned long paic_flags = current_paic_feature_flags(uid);
+    unsigned long paic_flags = 0;
 
     if (audit_only)
         *audit_only = 0;
 
     if (ad_current_profile_flags(&flags)) {
         if ((flags & feature) == 0) {
+            if (!persistent_uid_maybe_allowed(uid))
+                return 0;
+            paic_flags = current_paic_feature_flags(uid);
             if (paic_flags & feature)
                 return 1;
             return 0;
@@ -763,11 +767,20 @@ static int ad_should_apply(uid_t uid, unsigned long feature, int *audit_only)
         return 1;
     }
 
-    if (paic_flags & feature)
-        return 1;
-
-    if (ad_profile_only_mode)
+    if (ad_profile_only_mode) {
+        if (!persistent_uid_maybe_allowed(uid))
+            return 0;
+        paic_flags = current_paic_feature_flags(uid);
+        if (paic_flags & feature)
+            return 1;
         return 0;
+    }
+
+    if (persistent_uid_maybe_allowed(uid)) {
+        paic_flags = current_paic_feature_flags(uid);
+        if (paic_flags & feature)
+            return 1;
+    }
 
     if (uid < AID_APP_START || should_skip_process(uid))
         return 0;
@@ -1020,6 +1033,24 @@ static int persistent_uid_allowed(uid_t uid, unsigned long *flags)
     return allowed;
 }
 
+static int persistent_uid_maybe_allowed(uid_t uid)
+{
+    int count = persistent_self_protect_uid_count;
+    int i;
+
+    if (count <= 0)
+        return 0;
+    if (count > AD_MAX_PERSISTENT_UIDS)
+        count = AD_MAX_PERSISTENT_UIDS;
+
+    for (i = 0; i < count; i++) {
+        if (persistent_self_protect_uids[i].uid == uid)
+            return 1;
+    }
+
+    return 0;
+}
+
 static unsigned long current_paic_feature_flags(uid_t uid)
 {
     unsigned long persistent_flags = 0;
@@ -1052,7 +1083,8 @@ static int current_is_persistent_self_protect_target(uid_t uid,
     if (uid < AID_APP_START || uid_is_isolated(uid))
         return 0;
 
-    if (persistent_uid_allowed(uid, persistent_flags))
+    if (persistent_uid_maybe_allowed(uid) &&
+        persistent_uid_allowed(uid, persistent_flags))
         return 1;
 
     /*
