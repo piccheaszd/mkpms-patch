@@ -23,7 +23,7 @@
 #include "../common/kpm_demo_helpers.h"
 
 KPM_MODULE_INFO("anti-detect",
-                "1.2.37",
+                "1.2.38",
                 "GPL v2",
                 "wwb",
                 "Hide emulator, KernelPatch, and instrumentation artifacts from apps");
@@ -308,6 +308,15 @@ static int ad_has_feature_flags(unsigned long flags)
     return (flags & AD_F_FEATURE_MASK) != 0;
 }
 
+static int ad_can_hold_self_protect_rules(const struct anti_detect_profile *profile)
+{
+    if (!profile)
+        return 0;
+    if (ad_has_feature_flags(profile->flags))
+        return 1;
+    return profile->profile_id == AD_PERSISTENT_PROFILE_ID;
+}
+
 static void ad_log_profile_stats(const char *prefix,
                                  const struct anti_detect_profile *profile)
 {
@@ -457,7 +466,9 @@ static int ad_ensure_profile_flags(void *mm, unsigned long flags,
             p->flags |= flags;
             if (!old_has_features && ad_has_feature_flags(p->flags))
                 ad_feature_profile_count++;
-            if (!p->profile_id)
+            if (!p->profile_id &&
+                (flags != 0 || old_flags == 0 ||
+                 profile_id != AD_PERSISTENT_PROFILE_ID))
                 p->profile_id = profile_id;
             ad_unlock_profiles();
             return 0;
@@ -868,6 +879,11 @@ static long ad_add_self_protect_rule_mm(void *mm,
 
         if (!p->active || p->mm != mm)
             continue;
+
+        if (!ad_can_hold_self_protect_rules(p)) {
+            ret = -EPERM;
+            goto out_unlock;
+        }
 
         for (j = 0; j < AD_MAX_SELF_PROTECT_RULES; j++) {
             struct anti_detect_self_protect_rule *r = &p->self_protect_rules[j];
